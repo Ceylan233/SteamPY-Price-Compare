@@ -2,7 +2,7 @@
 // @name         SteamPY Price Compare
 // @name:zh-CN   SteamPY 价格对比
 // @namespace    https://github.com/Ceylan233/SteamPY-Price-Compare
-// @version      8.3.6
+// @version      8.3.7
 // @description  Steam 商店/购物车/愿望单/搜索页显示 SteamPY 实时最低挂单、Steam 史低和价格对比。
 // @author       Jiuyue
 // @match        https://store.steampowered.com/*
@@ -24,7 +24,7 @@
 (function () {
     "use strict";
 
-    const CURRENT_VERSION = "8.3.6";
+    const CURRENT_VERSION = "8.3.7";
     const INSTANCE_ATTR = "data-steampy-price-compare-active";
     const activeVersion = document.documentElement.getAttribute(INSTANCE_ATTR);
 
@@ -42,7 +42,7 @@
     const STEAMPY_BASE_URL = "https://steampy.com/";
     const STEAM_BASE_URL = "https://store.steampowered.com/";
 
-    const DONE = "data-steampy-v836-done";
+    const DONE = "data-steampy-v837-done";
     const CACHE_PREFIX = "steampy_v82_";
     const CACHE_TIME = 6 * 60 * 60 * 1000;
     const REALTIME_CACHE_TIME = 2 * 60 * 1000;
@@ -705,10 +705,17 @@ if (location.href.includes("/wishlist")) {
         });
     }
 
-    function computeEstimatedPrice(steamPrice) {
+    function computeEstimatedRange(steamPrice) {
         const n = Number(steamPrice);
         if (!n || Number.isNaN(n)) return null;
-        return Number((n * 0.88).toFixed(2));
+        return {
+            low: Number((n * 0.75).toFixed(2)),
+            high: Number((n * 0.85).toFixed(2))
+        };
+    }
+
+    function estimatedRangeText(range) {
+        return range ? `${money(range.low)} - ${money(range.high)}` : "未知";
     }
 
     function normalizePositivePrice(v) {
@@ -804,15 +811,15 @@ if (location.href.includes("/wishlist")) {
 
             const gameId = r.id;
             const realtimePrice = normalizePositivePrice(r.realKeyPrice);
-            const estimatedPrice = computeEstimatedPrice(steamPrice);
+            const estimatedRange = computeEstimatedRange(steamPrice);
             const steamHistoryPrice = normalizePositivePrice(history?.price ?? r.fixedHisPrice);
 
             if (realtimePrice) {
                 finalKeyPrice = realtimePrice;
                 finalSource = "实时挂单";
-            } else if (estimatedPrice) {
-                finalKeyPrice = estimatedPrice;
-                finalSource = "88折估算";
+            } else if (estimatedRange) {
+                finalKeyPrice = estimatedRange.high;
+                finalSource = "7.5-8.5折估算";
             }
 
             canCount = !!(steamPrice && finalKeyPrice);
@@ -827,14 +834,6 @@ if (location.href.includes("/wishlist")) {
                     ? `<span class="good-text">省 ${money(diff)} / ${Math.round(diff / Number(steamPrice) * 100)}%</span>`
                     : `<span class="warn-text">CDK暂不划算</span>`;
             }
-
-            const stockText = r.saleStock !== null && r.saleStock !== undefined
-                ? `<span class="price-link">库存：${r.saleStock}</span>`
-                : "";
-
-            const soldText = r.saleSold !== null && r.saleSold !== undefined
-                ? `<span class="price-link">销量：${r.saleSold}</span>`
-                : "";
 
             const realtimeText = realtimePrice
                 ? `<a href="${API.cdkDetail(gameId)}" target="_blank" class="price-link">PY实时最低：${money(realtimePrice)}</a> <span class="good-text">实时</span>`
@@ -855,23 +854,21 @@ if (location.href.includes("/wishlist")) {
                 ${historyText}
                 <a href="${API.balanceBuyDetail(gameId)}" target="_blank" class="price-link">PY余额购：${money(marketPrice)}</a>
                 <a href="${API.hotGameDetail(gameId)}" target="_blank" class="price-link">PY代购：${money(daiPrice)}</a>
-                ${!realtimePrice && estimatedPrice ? `<span class="price-link warn-text">倒余额预计：${money(estimatedPrice)}</span>` : ""}
-                ${stockText}
-                ${soldText}
+                ${!realtimePrice && estimatedRange ? `<span class="price-link warn-text">倒余额预计：${estimatedRangeText(estimatedRange)}</span>` : ""}
                 <span class="price-link">${saveText}</span>
             `;
 
         } else {
-            const estimatedPrice = computeEstimatedPrice(steamPrice);
-            finalKeyPrice = estimatedPrice;
-            finalSource = "88折估算";
+            const estimatedRange = computeEstimatedRange(steamPrice);
+            finalKeyPrice = estimatedRange?.high ?? null;
+            finalSource = "7.5-8.5折估算";
             canCount = !!(steamPrice && finalKeyPrice);
 
             const msg = pyRes?.message || "SteamPY未收录";
             content += `
                 <span class="price-link warn-text">PY实时最低：${msg}</span>
                 ${fallbackHistoryText}
-                <span class="price-link warn-text">倒余额预计价格：${money(finalKeyPrice)}</span>
+                <span class="price-link warn-text">倒余额预计价格：${estimatedRangeText(estimatedRange)}</span>
             `;
         }
 
@@ -908,7 +905,7 @@ if (location.href.includes("/wishlist")) {
             pyTotal += pyPrice;
             count += 1;
 
-            if (box.dataset.priceSource === "88折估算") estimateCount += 1;
+            if (box.dataset.priceSource === "7.5-8.5折估算") estimateCount += 1;
             if (box.dataset.priceSource === "实时挂单") realtimeCount += 1;
         });
 
