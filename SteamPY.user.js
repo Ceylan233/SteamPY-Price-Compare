@@ -1,16 +1,22 @@
 // ==UserScript==
-// @name         SteamPY 价格显示 V8.1.1
-// @version      8.1.0
-// @description  Steam 商店/购物车/愿望单/搜索页显示 SteamPY 价格；未收录或挂单为0按 Steam 当前价88折估算；购物车统计总价；去除 。
+// @name         SteamPY Price Compare
+// @name:zh-CN   SteamPY 价格对比
+// @namespace    https://github.com/Ceylan233/SteamPY-Price-Compare
+// @version      8.3.6
+// @description  Steam 商店/购物车/愿望单/搜索页显示 SteamPY 实时最低挂单、Steam 史低和价格对比。
 // @author       Jiuyue
 // @match        https://store.steampowered.com/*
 // @match        https://steampy.com/*
+// @match        https://www.steampy.com/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_registerMenuCommand
+// @grant        GM_openInTab
 // @connect      steampy.com
 // @connect      store.steampowered.com
+// @connect      api.augmentedsteam.com
+// @connect      api.xiaoheihe.cn
 // @run-at       document-end
 // @icon         https://steampy.com/m_logo.ico
 // ==/UserScript==
@@ -18,13 +24,44 @@
 (function () {
     "use strict";
 
+    const CURRENT_VERSION = "8.3.6";
+    const INSTANCE_ATTR = "data-steampy-price-compare-active";
+    const activeVersion = document.documentElement.getAttribute(INSTANCE_ATTR);
+
+    if (activeVersion && compareVersions(activeVersion, CURRENT_VERSION) >= 0) return;
+    document.documentElement.setAttribute(INSTANCE_ATTR, CURRENT_VERSION);
+
+    document.querySelectorAll(".price-box").forEach(box => {
+        if (box.dataset.steampyVersion !== CURRENT_VERSION) box.remove();
+    });
+
+    if (activeVersion) {
+        document.querySelector("#steampy-cart-summary")?.remove();
+    }
+
     const STEAMPY_BASE_URL = "https://steampy.com/";
     const STEAM_BASE_URL = "https://store.steampowered.com/";
 
-    const DONE = "data-steampy-v81-done";
-    const CACHE_PREFIX = "steampy_v81_";
+    const DONE = "data-steampy-v836-done";
+    const CACHE_PREFIX = "steampy_v82_";
     const CACHE_TIME = 6 * 60 * 60 * 1000;
+    const REALTIME_CACHE_TIME = 2 * 60 * 1000;
+    const HISTORY_CACHE_TIME = 24 * 60 * 60 * 1000;
     const DEBUG = false;
+    const historyQueue = new Map();
+    let historyQueueTimer = null;
+
+    function compareVersions(left, right) {
+        const a = String(left).split(".").map(Number);
+        const b = String(right).split(".").map(Number);
+        const length = Math.max(a.length, b.length);
+
+        for (let i = 0; i < length; i++) {
+            const diff = (a[i] || 0) - (b[i] || 0);
+            if (diff) return diff;
+        }
+        return 0;
+    }
 
     const API = {
         gameInfo: (subId, appId, type) =>
@@ -32,7 +69,7 @@
         gameDetail: (gameId) =>
             `${STEAMPY_BASE_URL}xboot/steamGame/getOne?gameId=${encodeURIComponent(gameId)}`,
         listSale: (gameId) =>
-            `${STEAMPY_BASE_URL}xboot/steamKeySale/listSale?pageNumber=1&pageSize=1&sort=keyPrice&order=asc&startDate=&endDate=&gameId=${encodeURIComponent(gameId)}`,
+            `${STEAMPY_BASE_URL}xboot/steamKeySale/listSale?pageNumber=1&pageSize=20&sort=keyPrice&order=asc&startDate=&endDate=&gameId=${encodeURIComponent(gameId)}`,
         cdkDetail: (gameId) =>
             `${STEAMPY_BASE_URL}cdkDetail?name=cn&gameId=${encodeURIComponent(gameId)}`,
         balanceBuyDetail: (gameId) =>
@@ -44,13 +81,19 @@
         packageDetails: (packageId) =>
             `${STEAM_BASE_URL}api/packagedetails?packageids=${encodeURIComponent(packageId)}&cc=cn&l=schinese`,
         bundlePage: (bundleId) =>
-            `${STEAM_BASE_URL}bundle/${encodeURIComponent(bundleId)}/`
+            `${STEAM_BASE_URL}bundle/${encodeURIComponent(bundleId)}/`,
+        augmentedSteamPrices: () =>
+            "https://api.augmentedsteam.com/prices/v2",
+        heyboxHistory: (appId) =>
+            `https://api.xiaoheihe.cn/game/get_game_prices/history/v2?appid=${encodeURIComponent(appId)}&platf=steam&cc=cn&days=9999`,
+        heyboxGame: (appId) =>
+            `https://www.xiaoheihe.cn/app/topic/game/pc/${encodeURIComponent(appId)}`
     };
 
     registerMenu();
 
-    if (location.hostname === "steampy.com") {
-        syncTokenFromSteamPY();
+    if (location.hostname === "steampy.com" || location.hostname.endsWith(".steampy.com")) {
+        startSteamPYTokenSync();
         return;
     }
 
@@ -61,11 +104,15 @@
     runScans();
 
     function log(...args) {
-        if (DEBUG) console.log("[SteamPY V8.1]", ...args);
+        if (DEBUG) console.log("[SteamPY V8.2]", ...args);
     }
 
     function registerMenu() {
         if (typeof GM_registerMenuCommand !== "function") return;
+
+        GM_registerMenuCommand(`当前版本：${CURRENT_VERSION}`, () => {
+            alert(`SteamPY 价格对比 ${CURRENT_VERSION}`);
+        });
 
         GM_registerMenuCommand("设置 SteamPY Token", () => {
             const oldToken = getToken();
@@ -87,37 +134,75 @@
             clearCache();
             alert("缓存已清空，刷新页面生效。");
         });
+
+        GM_registerMenuCommand("登录 SteamPY 并同步 Token", () => {
+            if (typeof GM_openInTab === "function") {
+                GM_openInTab(`${STEAMPY_BASE_URL}login`, { active: true, insert: true });
+            } else {
+                window.open(`${STEAMPY_BASE_URL}login`, "_blank");
+            }
+        });
+    }
+
+    function readSteamPYToken() {
+        try {
+            return String(
+                localStorage.getItem("accessToken") ||
+                localStorage.getItem("bbsToken") ||
+                document.cookie.match(/bbsToken=([^;]+)/)?.[1] ||
+                ""
+            ).trim();
+        } catch {
+            return "";
+        }
     }
 
     function syncTokenFromSteamPY() {
         try {
-            const token =
-                localStorage.getItem("accessToken") ||
-                localStorage.getItem("bbsToken") ||
-                document.cookie.match(/bbsToken=([^;]+)/)?.[1] ||
-                "";
+            const token = readSteamPYToken();
+            const savedToken = getToken();
 
-            if (token) {
-                GM_setValue("steampy_token", token.trim());
-                console.log("[SteamPY V8.1] 已自动同步 Token，回 Steam 页面刷新即可。");
-            } else {
-                console.log("[SteamPY V8.1] 当前 SteamPY 页面未检测到 Token。请确认已登录。");
+            if (token && token !== savedToken) {
+                GM_setValue("steampy_token", token);
+                clearCache();
+                console.info("[SteamPY V8.2] 已同步登录状态，回 Steam 页面刷新即可。");
+            } else if (!token && savedToken) {
+                GM_setValue("steampy_token", "");
+                clearCache();
+                console.info("[SteamPY V8.2] 已同步退出登录状态。");
             }
+
+            return token;
         } catch (e) {
-            console.warn("[SteamPY V8.1] Token 同步失败：", e);
+            console.warn("[SteamPY V8.2] Token 同步失败：", e);
+            return "";
         }
+    }
+
+    function startSteamPYTokenSync() {
+        let lastToken = syncTokenFromSteamPY();
+
+        // SteamPY 登录是 SPA 跳转，登录成功后页面通常不会重新加载。
+        const timer = setInterval(() => {
+            const token = readSteamPYToken();
+            if (token !== lastToken) {
+                lastToken = syncTokenFromSteamPY();
+            }
+        }, 1500);
+
+        window.addEventListener("pagehide", () => clearInterval(timer), { once: true });
     }
 
     function ensureTokenHintOnce() {
         const token = getToken();
         if (token) return;
 
-        const asked = sessionStorage.getItem("steampy_v81_token_hint");
+        const asked = sessionStorage.getItem("steampy_v82_token_hint");
         if (asked) return;
-        sessionStorage.setItem("steampy_v81_token_hint", "1");
+        sessionStorage.setItem("steampy_v82_token_hint", "1");
 
         setTimeout(() => {
-            console.info("[SteamPY V8.1] 未设置 SteamPY Token：脚本会显示公开统计价；如需实时最低挂单，请登录 steampy.com 后刷新一次，或在油猴菜单手动设置 Token。");
+            console.info("[SteamPY V8.2] 实时最低挂单需要登录 SteamPY。请使用油猴菜单打开登录页，登录成功后回 Steam 页面刷新。");
         }, 1000);
     }
 
@@ -127,6 +212,14 @@
         } catch {
             return "";
         }
+    }
+
+    function steamPYHeaders(token = getToken()) {
+        return {
+            accessToken: token,
+            APP_TOKEN: "",
+            Accept: "application/json, text/plain, */*"
+        };
     }
 
     function clearCache() {
@@ -154,12 +247,37 @@
         return requestText(url, headers).then(text => JSON.parse(text));
     }
 
-    function cacheGet(key) {
+    function requestJSONPost(url, data, headers = {}) {
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method: "POST",
+                url,
+                timeout: 20000,
+                data: JSON.stringify(data),
+                headers: {
+                    "Content-Type": "application/json",
+                    Accept: "application/json",
+                    ...headers
+                },
+                onload: res => {
+                    try {
+                        resolve(JSON.parse(res.responseText));
+                    } catch (error) {
+                        reject(error);
+                    }
+                },
+                onerror: reject,
+                ontimeout: reject
+            });
+        });
+    }
+
+    function cacheGet(key, maxAge = CACHE_TIME) {
         try {
             const raw = localStorage.getItem(CACHE_PREFIX + key);
             if (!raw) return null;
             const obj = JSON.parse(raw);
-            if (Date.now() - obj.time > CACHE_TIME) return null;
+            if (Date.now() - obj.time > maxAge) return null;
             return obj.data;
         } catch {
             return null;
@@ -275,10 +393,170 @@
         return null;
     }
 
+    function historyEntity(id, appId, type, purchaseKind) {
+        if (purchaseKind === "game") {
+            const fallbackType = type === "subid" ? "sub" : "app";
+            const fallbackId = type === "subid" ? String(id) : String(appId);
+            return {
+                provider: "heybox",
+                type: "app",
+                id: String(appId),
+                entityKey: `app/${appId}`,
+                fallbackType,
+                fallbackId,
+                fallbackEntityKey: `${fallbackType}/${fallbackId}`
+            };
+        }
+
+        const entityType = type === "bundleid" ? "bundle" : type === "subid" ? "sub" : "app";
+        const entityId = entityType === "app" ? String(appId) : String(id);
+        return {
+            provider: "augmented",
+            type: entityType,
+            id: entityId,
+            entityKey: `${entityType}/${entityId}`
+        };
+    }
+
+    function querySteamHistory(id, appId, type, purchaseKind) {
+        const entity = historyEntity(id, appId, type, purchaseKind);
+        const queueKey = `${entity.provider}:${entity.entityKey}`;
+        const cacheKey = `history_${queueKey}`;
+        const cached = cacheGet(cacheKey, HISTORY_CACHE_TIME);
+
+        if (cached?.checked) return Promise.resolve(cached.data || null);
+
+        return new Promise(resolve => {
+            const pending = historyQueue.get(queueKey);
+            if (pending) {
+                pending.resolvers.push(resolve);
+            } else {
+                historyQueue.set(queueKey, { ...entity, queueKey, cacheKey, resolvers: [resolve] });
+            }
+
+            clearTimeout(historyQueueTimer);
+            historyQueueTimer = setTimeout(flushSteamHistoryQueue, 80);
+        });
+    }
+
+    function resolveHistoryItem(item, data, cacheResult = true) {
+        if (cacheResult) cacheSet(item.cacheKey, { checked: true, data });
+        item.resolvers.forEach(resolve => resolve(data));
+    }
+
+    async function fetchHeyboxHistory(item) {
+        try {
+            const response = await requestJSON(API.heyboxHistory(item.id), {
+                Referer: API.heyboxGame(item.id),
+                Accept: "application/json"
+            });
+            const result = response?.status === "ok" ? response.result : null;
+            const amount = normalizePositivePrice(result?.lowest_info?.price);
+            if (!amount) return null;
+
+            return {
+                price: amount,
+                cut: Number(result?.lowest_info?.discount) || null,
+                timestamp: result?.lowest_info?.date || null,
+                url: API.heyboxGame(item.id),
+                source: "小黑盒"
+            };
+        } catch (error) {
+            log("Heybox history failed", item.id, error);
+            return null;
+        }
+    }
+
+    async function mapWithConcurrency(items, limit, worker) {
+        const results = new Array(items.length);
+        let nextIndex = 0;
+
+        async function runWorker() {
+            while (nextIndex < items.length) {
+                const index = nextIndex++;
+                results[index] = await worker(items[index]);
+            }
+        }
+
+        const workers = Array.from(
+            { length: Math.min(limit, items.length) },
+            () => runWorker()
+        );
+        await Promise.all(workers);
+        return results;
+    }
+
+    async function fetchAugmentedHistories(items) {
+        if (!items.length) return new Map();
+
+        const body = {
+            country: "CN",
+            apps: [...new Set(items.filter(item => item.type === "app").map(item => Number(item.id)))],
+            subs: [...new Set(items.filter(item => item.type === "sub").map(item => Number(item.id)))],
+            bundles: [...new Set(items.filter(item => item.type === "bundle").map(item => Number(item.id)))],
+            voucher: false,
+            shops: [61]
+        };
+        const response = await requestJSONPost(API.augmentedSteamPrices(), body);
+        const results = new Map();
+
+        items.forEach(item => {
+            const entityKey = item.augmentedEntityKey || item.entityKey;
+            const priceData = response?.prices?.[entityKey];
+            const amount = normalizePositivePrice(priceData?.lowest?.price?.amount);
+            results.set(item.queueKey, amount
+                ? {
+                    price: amount,
+                    cut: Number(priceData?.lowest?.cut) || null,
+                    timestamp: priceData?.lowest?.timestamp || null,
+                    url: priceData?.urls?.history || null,
+                    source: "Augmented Steam / ITAD"
+                }
+                : null);
+        });
+
+        return results;
+    }
+
+    async function flushSteamHistoryQueue() {
+        const batch = [...historyQueue.values()];
+        historyQueue.clear();
+        historyQueueTimer = null;
+        if (!batch.length) return;
+
+        const heyboxItems = batch.filter(item => item.provider === "heybox");
+        const augmentedItems = batch.filter(item => item.provider === "augmented");
+
+        const heyboxResults = await mapWithConcurrency(heyboxItems, 4, fetchHeyboxHistory);
+        heyboxItems.forEach((item, index) => {
+            const data = heyboxResults[index];
+            if (data) {
+                resolveHistoryItem(item, data);
+            } else {
+                augmentedItems.push({
+                    ...item,
+                    type: item.fallbackType,
+                    id: item.fallbackId,
+                    augmentedEntityKey: item.fallbackEntityKey
+                });
+            }
+        });
+
+        try {
+            const results = await fetchAugmentedHistories(augmentedItems);
+            augmentedItems.forEach(item => {
+                resolveHistoryItem(item, results.get(item.queueKey) || null);
+            });
+        } catch (error) {
+            log("Augmented Steam history failed", error);
+            augmentedItems.forEach(item => resolveHistoryItem(item, null, false));
+        }
+    }
+
     async function querySteamPY(id, appId, type) {
         const token = getToken();
         const cacheKey = `py_${type}_${id}_${appId}_${token ? "token" : "public"}`;
-        const cached = cacheGet(cacheKey);
+        const cached = cacheGet(cacheKey, token ? REALTIME_CACHE_TIME : CACHE_TIME);
         if (cached) return cached;
 
         try {
@@ -293,41 +571,54 @@
             const game = gameRes.result;
             let detail = game;
 
-            try {
-                const one = await requestJSON(API.gameDetail(game.id));
-                if (one?.success && one?.result) detail = one.result;
-            } catch (e) {
-                log("getOne failed", e);
+            if (token) {
+                try {
+                    const one = await requestJSON(API.gameDetail(game.id), steamPYHeaders(token));
+                    if (one?.success && one?.result) detail = one.result;
+                } catch (e) {
+                    log("getOne failed", e);
+                }
             }
 
             let realtimePrice = null;
             let stock = null;
             let sold = null;
-            let saleSource = "public";
-            let saleMessage = "公开统计";
+            let saleSource = "none";
+            let saleStatus = token ? "empty" : "login_required";
+            let saleMessage = token ? "暂无在售挂单" : "登录 SteamPY 后显示";
 
             if (token) {
                 try {
-                    const sale = await requestJSON(API.listSale(game.id), {
-                        accessToken: token,
-                        APP_TOKEN: "",
-                        Accept: "application/json, text/plain, */*"
-                    });
+                    const sale = await requestJSON(API.listSale(game.id), steamPYHeaders(token));
 
                     log("listSale", game.id, sale);
 
                     if (sale?.success && Array.isArray(sale?.result?.content) && sale.result.content.length > 0) {
-                        const first = sale.result.content[0];
-                        realtimePrice = Number(first.keyPrice);
-                        stock = first.stock ?? null;
-                        sold = first.sold ?? null;
-                        saleSource = "listSale";
-                        saleMessage = "实时";
-                    } else if (sale?.code === 401) {
-                        saleMessage = "Token失效";
+                        const available = sale.result.content
+                            .filter(item => normalizePositivePrice(item?.keyPrice) && Number(item?.stock ?? 1) > 0)
+                            .sort((a, b) => Number(a.keyPrice) - Number(b.keyPrice));
+                        const lowest = available[0];
+
+                        if (lowest) {
+                            realtimePrice = Number(lowest.keyPrice);
+                            stock = lowest.stock ?? null;
+                            sold = lowest.sold ?? null;
+                            saleSource = "listSale";
+                            saleStatus = "ok";
+                            saleMessage = "实时挂单";
+                        }
+                    } else if (Number(sale?.code) === 401) {
+                        saleStatus = "unauthorized";
+                        saleMessage = "登录已失效，请重新登录";
+                        GM_setValue("steampy_token", "");
+                        clearCache();
+                    } else if (!sale?.success) {
+                        saleStatus = "error";
+                        saleMessage = sale?.message || "实时挂单获取失败";
                     }
                 } catch (e) {
-                    saleMessage = "实时失败";
+                    saleStatus = "error";
+                    saleMessage = "实时挂单获取失败";
                     log("listSale failed", e);
                 }
             }
@@ -337,13 +628,21 @@
                 result: {
                     ...game,
                     ...detail,
-                    realKeyPrice: realtimePrice ?? Number(detail.keyPrice ?? game.keyPrice),
-                    fixedHisPrice: detail.hisPrice ?? detail.gamePrice ?? game.hisPrice ?? game.gamePrice ?? null,
+                    realKeyPrice: realtimePrice,
+                    fixedHisPrice:
+                        detail.hisPrice ??
+                        detail.historyPrice ??
+                        detail.lowestPrice ??
+                        game.hisPrice ??
+                        game.historyPrice ??
+                        game.lowestPrice ??
+                        null,
                     keyTxAmt: detail.keyTxAmt ?? game.keyTxAmt ?? null,
                     keyAveAmt: detail.keyAveAmt ?? game.keyAveAmt ?? null,
                     saleStock: stock,
                     saleSold: sold,
                     saleSource,
+                    saleStatus,
                     saleMessage
                 }
             };
@@ -351,7 +650,7 @@
             cacheSet(cacheKey, result);
             return result;
         } catch (e) {
-            console.error("[SteamPY V8.1] 请求失败", e);
+            console.error("[SteamPY V8.2] 请求失败", e);
             return { success: false, message: "SteamPY请求失败" };
         }
     }
@@ -359,6 +658,8 @@
     function createPlaceholder(parent) {
         const box = document.createElement("div");
         box.className = "price-box";
+        box.dataset.steampyVersion = CURRENT_VERSION;
+        box.title = `SteamPY 价格对比 ${CURRENT_VERSION}`;
         box.innerHTML = `<span class="loading-text">SteamPY 加载中...</span>`;
 
         // 愿望单：不要塞进价格/标题的小节点，统一追加到整张卡片底部，避免遮挡标题。
@@ -398,6 +699,12 @@ if (location.href.includes("/wishlist")) {
         box.innerHTML = html;
     }
 
+    function removeLegacyPriceBoxes() {
+        document.querySelectorAll(".price-box").forEach(box => {
+            if (box.dataset.steampyVersion !== CURRENT_VERSION) box.remove();
+        });
+    }
+
     function computeEstimatedPrice(steamPrice) {
         const n = Number(steamPrice);
         if (!n || Number.isNaN(n)) return null;
@@ -405,12 +712,88 @@ if (location.href.includes("/wishlist")) {
     }
 
     function normalizePositivePrice(v) {
-        const n = Number(v);
+        const raw = typeof v === "string"
+            ? v.replace(/,/g, "").match(/[0-9]+(?:\.[0-9]+)?/)?.[0]
+            : v;
+        const n = Number(raw);
         return n > 0 && !Number.isNaN(n) ? n : null;
     }
 
-    function displayPrices(pyRes, placeholder, subId, steamPrice) {
+    function parseSteamDiscount(card) {
+        const text = card?.querySelector(".discount_pct, .bundle_discount")?.textContent || "";
+        const value = text.match(/\d+(?:\.\d+)?/)?.[0];
+        return value ? `-${value}%` : "";
+    }
+
+    function getPurchaseKind(card, type) {
+        if (type === "bundleid") return "bundle";
+
+        const appIds = new Set(
+            [...(card?.querySelectorAll("[data-ds-appid]") || [])]
+                .map(el => el.getAttribute("data-ds-appid"))
+                .filter(Boolean)
+        );
+        const text = card?.innerText || "";
+
+        return type === "subid" && (appIds.size > 1 || /包含\s*\d+\s*(?:件|个)/.test(text))
+            ? "package"
+            : "game";
+    }
+
+    function buildHistoryText({ purchaseKind, history, fallbackPrice, steamPrice, steamDiscount }) {
+        const historyPrice = normalizePositivePrice(history?.price ?? fallbackPrice);
+        const url = /^https:\/\//.test(history?.url || "") ? history.url : "";
+
+        if (historyPrice) {
+            let compare = "";
+            if (steamPrice) {
+                const historyGap = Number(steamPrice) - historyPrice;
+                if (historyGap <= 0.01) {
+                    compare = ` <span class="good-text">当前已达史低</span>`;
+                }
+            }
+
+            const label = purchaseKind === "bundle"
+                ? "组合包史低"
+                : purchaseKind === "package"
+                    ? "套餐史低"
+                    : "Steam史低";
+            const discount = history?.cut
+                ? ` <span class="good-text">-${Math.abs(Number(history.cut))}%</span>`
+                : "";
+            const priceText = `${label}：${money(historyPrice)}${discount}`;
+            const priceElement = url
+                ? `<a href="${url}" target="_blank" class="price-link">${priceText}</a>`
+                : `<span class="price-link">${priceText}</span>`;
+            const sourceText = history?.source === "小黑盒"
+                ? ` <span class="weak-text">来源：小黑盒</span>`
+                : history?.source
+                    ? ` <span class="weak-text">来源：ITAD</span>`
+                    : "";
+            return `${priceElement}${sourceText}${compare}`;
+        }
+
+        if (purchaseKind === "bundle") {
+            const current = steamDiscount ? `，当前 ${steamDiscount}` : "";
+            return `<span class="weak-text">组合包史低：暂未收录${current}</span>`;
+        }
+
+        if (purchaseKind === "package") {
+            return `<span class="weak-text">套餐史低：暂未收录</span>`;
+        }
+
+        return `<span class="weak-text">Steam史低：暂无数据</span>`;
+    }
+
+    function displayPrices(pyRes, history, placeholder, id, appId, type, purchaseKind, steamPrice, steamDiscount) {
         let content = "";
+        const fallbackHistoryText = buildHistoryText({
+            purchaseKind,
+            history,
+            fallbackPrice: null,
+            steamPrice,
+            steamDiscount
+        });
 
         let finalKeyPrice = null;
         let finalSource = "";
@@ -420,12 +803,13 @@ if (location.href.includes("/wishlist")) {
             const r = pyRes.result;
 
             const gameId = r.id;
-            const realtimeOrPublicPrice = normalizePositivePrice(r.realKeyPrice ?? r.keyPrice);
+            const realtimePrice = normalizePositivePrice(r.realKeyPrice);
             const estimatedPrice = computeEstimatedPrice(steamPrice);
+            const steamHistoryPrice = normalizePositivePrice(history?.price ?? r.fixedHisPrice);
 
-            if (realtimeOrPublicPrice) {
-                finalKeyPrice = realtimeOrPublicPrice;
-                finalSource = r.saleSource === "listSale" ? "实时挂单" : "公开统计";
+            if (realtimePrice) {
+                finalKeyPrice = realtimePrice;
+                finalSource = "实时挂单";
             } else if (estimatedPrice) {
                 finalKeyPrice = estimatedPrice;
                 finalSource = "88折估算";
@@ -435,7 +819,6 @@ if (location.href.includes("/wishlist")) {
 
             const marketPrice = r.marketPrice ?? null;
             const daiPrice = r.daiPrice ?? null;
-            const publicKeyPrice = r.keyPrice ?? null;
 
             let saveText = "";
             if (steamPrice && finalKeyPrice) {
@@ -445,13 +828,6 @@ if (location.href.includes("/wishlist")) {
                     : `<span class="warn-text">CDK暂不划算</span>`;
             }
 
-            const sourceText =
-                finalSource === "实时挂单"
-                    ? `<span class="good-text">实时</span>`
-                    : finalSource === "公开统计"
-                        ? `<span class="weak-text">${r.saleMessage || "公开统计"}</span>`
-                        : ``;
-
             const stockText = r.saleStock !== null && r.saleStock !== undefined
                 ? `<span class="price-link">库存：${r.saleStock}</span>`
                 : "";
@@ -460,25 +836,30 @@ if (location.href.includes("/wishlist")) {
                 ? `<span class="price-link">销量：${r.saleSold}</span>`
                 : "";
 
-            const title = finalSource === "88折估算" ? "倒余额预计价格" : "PY最低挂单";
+            const realtimeText = realtimePrice
+                ? `<a href="${API.cdkDetail(gameId)}" target="_blank" class="price-link">PY实时最低：${money(realtimePrice)}</a> <span class="good-text">实时</span>`
+                : `<a href="${API.cdkDetail(gameId)}" target="_blank" class="price-link warn-text">PY实时最低：${r.saleMessage || "暂不可用"}</a>`;
+
+            const historyText = steamHistoryPrice
+                ? buildHistoryText({
+                    purchaseKind,
+                    history,
+                    fallbackPrice: steamHistoryPrice,
+                    steamPrice,
+                    steamDiscount
+                })
+                : fallbackHistoryText;
 
             content += `
-                <a href="${API.cdkDetail(gameId)}" target="_blank" class="price-link">${title}：${money(finalKeyPrice)}</a>
-                ${sourceText}
+                ${realtimeText}
+                ${historyText}
                 <a href="${API.balanceBuyDetail(gameId)}" target="_blank" class="price-link">PY余额购：${money(marketPrice)}</a>
                 <a href="${API.hotGameDetail(gameId)}" target="_blank" class="price-link">PY代购：${money(daiPrice)}</a>
+                ${!realtimePrice && estimatedPrice ? `<span class="price-link warn-text">倒余额预计：${money(estimatedPrice)}</span>` : ""}
                 ${stockText}
                 ${soldText}
                 <span class="price-link">${saveText}</span>
             `;
-
-            if (
-                publicKeyPrice &&
-                finalKeyPrice &&
-                Math.abs(Number(publicKeyPrice) - Number(finalKeyPrice)) > 0.01
-            ) {
-                content += `<span class="weak-text">公开价：${money(publicKeyPrice)}</span>`;
-            }
 
         } else {
             const estimatedPrice = computeEstimatedPrice(steamPrice);
@@ -488,8 +869,9 @@ if (location.href.includes("/wishlist")) {
 
             const msg = pyRes?.message || "SteamPY未收录";
             content += `
+                <span class="price-link warn-text">PY实时最低：${msg}</span>
+                ${fallbackHistoryText}
                 <span class="price-link warn-text">倒余额预计价格：${money(finalKeyPrice)}</span>
-                <span class="weak-text">${msg}</span>
             `;
         }
 
@@ -578,8 +960,32 @@ if (location.href.includes("/wishlist")) {
         `;
     }
 
+    function priceBoxKey(id, appId, type) {
+        return `${type}:${id}:${appId}`;
+    }
+
+    function findPriceBoxes(key) {
+        return [...document.querySelectorAll(".price-box")]
+            .filter(box => box.dataset.steampyKey === key);
+    }
+
     async function attachPrice(card, id, appId, type) {
-        if (!card || !id || !appId || !type || card.hasAttribute(DONE)) return;
+        if (!card || !id || !appId || !type) return;
+
+        const key = priceBoxKey(id, appId, type);
+        const existingBoxes = findPriceBoxes(key);
+        const existingBox = existingBoxes[0];
+
+        if (existingBox) {
+            existingBoxes.slice(1).forEach(box => box.remove());
+            card.setAttribute(DONE, "1");
+
+            if (location.href.includes("/wishlist") && existingBox.previousElementSibling !== card) {
+                card.insertAdjacentElement("afterend", existingBox);
+            }
+            return;
+        }
+
         card.setAttribute(DONE, "1");
 
         let target;
@@ -588,13 +994,8 @@ if (location.href.includes("/wishlist")) {
             // 详情页 / DLC 独立页：整块购买区域作为定位基准。
             target = card;
         } else if (location.href.includes("/wishlist")) {
-            // 愿望单：不要插进 Steam 的价格小块，否则会压到标题。
-            target =
-                card.querySelector("[class*='content']") ||
-                card.querySelector("[class*='Content']") ||
-                card.querySelector("[class*='right']") ||
-                card.querySelector("[class*='Right']") ||
-                card;
+            // 愿望单价格框固定跟在整张卡片后面。
+            target = card;
         } else {
             target =
                 card.querySelector(".ysGS-IPPWEkwN-O5rr-0V") ||
@@ -604,10 +1005,26 @@ if (location.href.includes("/wishlist")) {
         }
 
         const placeholder = createPlaceholder(target);
+        placeholder.dataset.steampyKey = key;
         const steamPrice = parseSteamPrice(card);
+        const steamDiscount = parseSteamDiscount(card);
+        const purchaseKind = getPurchaseKind(card, type);
 
-        const pyRes = await querySteamPY(id, appId, type);
-        displayPrices(pyRes, placeholder, id, steamPrice);
+        const [pyRes, history] = await Promise.all([
+            querySteamPY(id, appId, type),
+            querySteamHistory(id, appId, type, purchaseKind)
+        ]);
+        displayPrices(
+            pyRes,
+            history,
+            placeholder,
+            id,
+            appId,
+            type,
+            purchaseKind,
+            steamPrice,
+            steamDiscount
+        );
     }
 
     function getStoreAppId() {
@@ -692,37 +1109,206 @@ if (location.href.includes("/wishlist")) {
         }
     }
 
-function findListCard(link) {
+    function findListCard(link) {
+        let el = link;
 
-    if (location.href.includes("/wishlist")) {
-        return (
-            link.closest("[data-rfd-draggable-id]") ||
-            link.closest(".Panel") ||
-            link.closest("[class*='Panel']") ||
-            link.parentElement
+        for (let i = 0; i < 10; i++) {
+            if (!el?.parentElement) break;
+
+            const p = el.parentElement;
+            const text = p.innerText || "";
+
+            if (text.length > 10 && text.length < 4000 && text.includes("¥")) {
+                return p;
+            }
+
+            el = p;
+        }
+
+        return link.parentElement;
+    }
+
+    function findWishlistCard(link) {
+        let el = link;
+
+        for (let i = 0; i < 12; i++) {
+            if (!el?.parentElement) break;
+            el = el.parentElement;
+
+            const text = el.innerText || "";
+            const hasCardAction = /添加(?:至|到)购物车|加入购物车|移除|发行日期|Add to Cart|Remove|Release Date/i.test(text);
+            if (
+                hasCardAction &&
+                text.length > 10 &&
+                text.length < 5000 &&
+                el.querySelector('a[href*="/app/"]')
+            ) {
+                return el;
+            }
+        }
+
+        return null;
+    }
+
+    function getWishlistCards() {
+        const exactCards = [...new Set([
+            ...document.querySelectorAll(".wishlist_row"),
+            ...document.querySelectorAll("[data-rfd-draggable-id]"),
+            ...[...document.querySelectorAll('[id^="game_"]')]
+                .filter(card => /^game_\d+$/.test(card.id) && card.querySelector('a[href*="/app/"]'))
+        ])].filter(card => wishlistAppId(card));
+        if (exactCards.length) return exactCards;
+
+        const root =
+            document.querySelector("#wishlist_ctn") ||
+            document.querySelector("#wishlist_items") ||
+            document.querySelector("[class*='WishlistPage']") ||
+            document.querySelector("[data-featuretarget='react-root']") ||
+            document.querySelector("main") ||
+            document.body;
+        if (!root) return [];
+
+        const cardsByApp = new Map();
+        root.querySelectorAll('a[href*="/app/"]').forEach(link => {
+            const appId = appIdFromUrl(link.href);
+            if (!appId || cardsByApp.has(appId)) return;
+
+            const card = findWishlistCard(link);
+            if (card) cardsByApp.set(appId, card);
+        });
+
+        return [...cardsByApp.values()];
+    }
+
+    function wishlistAppId(card) {
+        const direct =
+            card.getAttribute("data-app-id") ||
+            card.getAttribute("data-appid") ||
+            card.dataset?.appid ||
+            card.id?.match(/(?:game|app)[_-](\d+)/)?.[1];
+
+        if (direct && /^\d+$/.test(String(direct))) return String(direct);
+
+        const link = card.querySelector('a[href*="/app/"]');
+        return appIdFromUrl(link?.href);
+    }
+
+    async function attachWishlistPrice(card, appId) {
+        if (!card || !appId) return;
+
+        const key = `wishlist:${appId}`;
+        const existingBoxes = findPriceBoxes(key);
+        const existingBox = existingBoxes[0];
+
+        if (existingBox) {
+            existingBoxes.slice(1).forEach(box => box.remove());
+            card.setAttribute(DONE, "1");
+            if (existingBox.previousElementSibling !== card) {
+                card.insertAdjacentElement("afterend", existingBox);
+            }
+            return;
+        }
+
+        // 先显示结果区。Steam 的 appdetails 可能限流，不能让套餐映射阻塞史低显示。
+        card.setAttribute(DONE, "1");
+        const placeholder = createPlaceholder(card);
+        placeholder.dataset.steampyKey = key;
+
+        const steamPrice = parseSteamPrice(card);
+        const steamDiscount = parseSteamDiscount(card);
+        const historyPromise = querySteamHistory(appId, appId, "appid", "game");
+        const packagePromise = appToPackage(appId);
+        const history = await historyPromise;
+
+        if (!placeholder.isConnected) return;
+        displayPrices(
+            { success: false, message: "SteamPY价格匹配中" },
+            history,
+            placeholder,
+            appId,
+            appId,
+            "appid",
+            "game",
+            steamPrice,
+            steamDiscount
+        );
+
+        const subId = await packagePromise;
+        const type = subId ? "subid" : "appid";
+        const id = subId || appId;
+        const pyRes = await (subId
+            ? querySteamPY(subId, appId, type)
+            : Promise.resolve({ success: false, message: "SteamPY套餐匹配失败" }));
+
+        if (!placeholder.isConnected) return;
+        displayPrices(
+            pyRes,
+            history,
+            placeholder,
+            id,
+            appId,
+            type,
+            "game",
+            steamPrice,
+            steamDiscount
         );
     }
 
-    let el = link;
+    function cleanupWishlistPriceBoxes(cards) {
+        const validCards = new Set(cards);
+        const usedCards = new Set();
+        const usedKeys = new Set();
 
-    for (let i = 0; i < 10; i++) {
-        if (!el?.parentElement) break;
+        document.querySelectorAll(".price-box").forEach(box => {
+            const card = box.previousElementSibling;
+            const key = box.dataset.steampyKey;
+            const valid =
+                key &&
+                validCards.has(card) &&
+                !usedCards.has(card) &&
+                !usedKeys.has(key);
 
-        const p = el.parentElement;
-        const text = p.innerText || "";
+            if (!valid) {
+                box.remove();
+                return;
+            }
 
-        if (text.length > 10 && text.length < 4000 && text.includes("¥")) {
-            return p;
-        }
+            usedCards.add(card);
+            usedKeys.add(key);
+        });
 
-        el = p;
+        cards.forEach(card => {
+            const box = card.nextElementSibling;
+            if (!box?.classList.contains("price-box") || !box.dataset.steampyKey) {
+                card.removeAttribute(DONE);
+            }
+        });
     }
 
-    return link.parentElement;
-}
+    async function scanWishlist() {
+        const cards = getWishlistCards();
+        cleanupWishlistPriceBoxes(cards);
+
+        for (const card of cards) {
+            if (!card || card.hasAttribute(DONE)) continue;
+
+            const appId = wishlistAppId(card);
+            if (!appId) continue;
+
+            attachWishlistPrice(card, appId);
+        }
+
+        cleanupWishlistPriceBoxes(cards);
+    }
 
     async function scanWishlistAndSearch() {
         if (!location.href.includes("/wishlist") && !location.href.includes("/search")) return;
+
+        if (location.href.includes("/wishlist")) {
+            await scanWishlist();
+            return;
+        }
+
         const links = [...document.querySelectorAll('a[href*="/app/"]')];
         const seen = new Set();
 
@@ -775,7 +1361,10 @@ function findListCard(link) {
         let timer = null;
         const observer = new MutationObserver(() => {
             clearTimeout(timer);
-            timer = setTimeout(scan, 700);
+            timer = setTimeout(() => {
+                removeLegacyPriceBoxes();
+                scan();
+            }, 700);
         });
         observer.observe(document.body, { childList: true, subtree: true });
     }
@@ -795,6 +1384,10 @@ function findListCard(link) {
                 overflow:hidden;
                 white-space:normal;
                 line-height:1.65;
+                display:flex;
+                flex-wrap:wrap;
+                align-items:center;
+                gap:3px 8px;
             }
             .steampy-app-box {
                 margin:8px 0 10px 0;
