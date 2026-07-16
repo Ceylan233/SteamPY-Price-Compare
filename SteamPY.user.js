@@ -2,7 +2,7 @@
 // @name         SteamPY Price Compare
 // @name:zh-CN   SteamPY 价格对比
 // @namespace    https://github.com/Ceylan233/SteamPY-Price-Compare
-// @version      8.4.6
+// @version      8.4.7
 // @description  Steam 商店/购物车/愿望单/搜索页显示 SteamPY 实时最低挂单、Steam 史低和价格对比。
 // @author       Jiuyue
 // @match        https://store.steampowered.com/*
@@ -24,7 +24,7 @@
 (function () {
     "use strict";
 
-    const CURRENT_VERSION = "8.4.6";
+    const CURRENT_VERSION = "8.4.7";
     const INSTANCE_ATTR = "data-steampy-price-compare-active";
     const activeVersion = document.documentElement.getAttribute(INSTANCE_ATTR);
 
@@ -42,7 +42,7 @@
     const STEAMPY_BASE_URL = "https://steampy.com/";
     const STEAM_BASE_URL = "https://store.steampowered.com/";
 
-    const DONE = "data-steampy-v846-done";
+    const DONE = "data-steampy-v847-done";
     const CACHE_PREFIX = "steampy_v82_";
     const CACHE_TIME = 6 * 60 * 60 * 1000;
     const REALTIME_CACHE_TIME = 2 * 60 * 1000;
@@ -796,34 +796,36 @@ if (location.href.includes("/wishlist")) {
     }
 
     function updateWishlistBottomSpace() {
-        const footer = document.querySelector("#footer, .responsive_footer");
-        if (!footer) return;
-
         document.querySelector("#steampy-wishlist-bottom-spacer")?.remove();
-        const spacer = document.querySelector("#footer_spacer");
-        if (!spacer) return;
-
-        if (!spacer.dataset.steampyBaseHeight) {
-            spacer.dataset.steampyBaseHeight = String(parseFloat(getComputedStyle(spacer).height) || 0);
-            spacer.dataset.steampyExtraHeight = "0";
+        const footerSpacer = document.querySelector("#footer_spacer");
+        if (footerSpacer?.dataset.steampyBaseHeight) {
+            footerSpacer.style.height = `${Number(footerSpacer.dataset.steampyBaseHeight)}px`;
+            delete footerSpacer.dataset.steampyBaseHeight;
+            delete footerSpacer.dataset.steampyExtraHeight;
         }
 
-        const baseHeight = Number(spacer.dataset.steampyBaseHeight || 0);
-        const currentExtra = Number(spacer.dataset.steampyExtraHeight || 0);
+        const root =
+            document.querySelector("#wishlist_ctn") ||
+            document.querySelector("#wishlist_items") ||
+            document.querySelector("[class*='WishlistPage']");
+        if (!root) return;
+
+        if (!root.dataset.steampyBaseMarginBottom) {
+            root.dataset.steampyBaseMarginBottom = String(parseFloat(getComputedStyle(root).marginBottom) || 0);
+        }
+        const baseMargin = Number(root.dataset.steampyBaseMarginBottom || 0);
 
         const boxes = [...document.querySelectorAll('.price-box[data-steampy-key^="wishlist:"]')]
             .filter(box => !box.closest("#steampy-wishlist-box-parking") && box.offsetParent !== null);
         if (!boxes.length) {
-            spacer.dataset.steampyExtraHeight = "0";
-            spacer.style.height = `${baseHeight}px`;
+            root.style.marginBottom = `${baseMargin}px`;
             return;
         }
 
-        const lastBottom = Math.max(...boxes.map(box => box.getBoundingClientRect().bottom));
-        const baseFooterTop = footer.getBoundingClientRect().top - currentExtra;
-        const requiredExtra = Math.max(0, Math.ceil(lastBottom - baseFooterTop + 24));
-        spacer.dataset.steampyExtraHeight = String(requiredExtra);
-        spacer.style.height = `${baseHeight + requiredExtra}px`;
+        const lastBox = boxes.reduce((last, box) =>
+            box.getBoundingClientRect().bottom > last.getBoundingClientRect().bottom ? box : last
+        );
+        root.style.marginBottom = `${baseMargin + Math.ceil(lastBox.getBoundingClientRect().height) + 32}px`;
     }
 
     function removeLegacyPriceBoxes() {
@@ -1539,7 +1541,12 @@ if (location.href.includes("/wishlist")) {
             claimedBoxes.add(box);
         });
 
+        if (!cards.length) return;
+
         const parking = getWishlistBoxParking();
+        document.querySelectorAll('.price-box[data-steampy-key^="wishlist:"]').forEach(box => {
+            if (!claimedBoxes.has(box) && box.parentElement !== parking) parking.appendChild(box);
+        });
         renderedPriceCache.forEach((cached, key) => {
             if (!key.startsWith("wishlist:") || !cached?.box || claimedBoxes.has(cached.box)) return;
             if (!cached.box.isConnected) parking.appendChild(cached.box);
