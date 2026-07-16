@@ -33,7 +33,7 @@ SteamPY 的卖家挂单接口和游戏详情接口需要登录。安装脚本后
 史低链接会打开 IsThereAnyDeal 的对应价格历史页。以 X4 组合包 `30502` 为例，接口返回当前价 `¥366.40`、Steam 史低 `¥101.12`、史低折扣 `-72%`。
 
 愿望单：
-<img width="1272" height="764" alt="image" src="https://github.com/user-attachments/assets/f45ebbe2-43bc-4a80-a940-714ea49ca7bf" />
+<img width="1129" height="1073" alt="image" src="https://github.com/user-attachments/assets/4055fb97-29a7-4311-b15c-35bdb0212313" />
 购物车：
 <img width="1070" height="1008" alt="image" src="https://github.com/user-attachments/assets/16f72dd7-9520-4185-802d-2b58e400d33e" />
 商店页面：
