@@ -2,7 +2,7 @@
 // @name         SteamPY Price Compare
 // @name:zh-CN   SteamPY 价格对比
 // @namespace    https://github.com/Ceylan233/SteamPY-Price-Compare
-// @version      8.4.8
+// @version      1.2
 // @description  Steam 商店/购物车/愿望单/搜索页显示 SteamPY 实时最低挂单、Steam 史低和价格对比。
 // @author       Jiuyue
 // @match        https://store.steampowered.com/*
@@ -24,7 +24,7 @@
 (function () {
     "use strict";
 
-    const CURRENT_VERSION = "8.4.8";
+    const CURRENT_VERSION = "1.2";
     const INSTANCE_ATTR = "data-steampy-price-compare-active";
     const activeVersion = document.documentElement.getAttribute(INSTANCE_ATTR);
 
@@ -42,7 +42,7 @@
     const STEAMPY_BASE_URL = "https://steampy.com/";
     const STEAM_BASE_URL = "https://store.steampowered.com/";
 
-    const DONE = "data-steampy-v848-done";
+    const DONE = "data-steampy-v12-done";
     const CACHE_PREFIX = "steampy_v82_";
     const CACHE_TIME = 6 * 60 * 60 * 1000;
     const REALTIME_CACHE_TIME = 2 * 60 * 1000;
