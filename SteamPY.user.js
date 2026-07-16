@@ -2,7 +2,7 @@
 // @name         SteamPY Price Compare
 // @name:zh-CN   SteamPY 价格对比
 // @namespace    https://github.com/Ceylan233/SteamPY-Price-Compare
-// @version      8.4.7
+// @version      8.4.8
 // @description  Steam 商店/购物车/愿望单/搜索页显示 SteamPY 实时最低挂单、Steam 史低和价格对比。
 // @author       Jiuyue
 // @match        https://store.steampowered.com/*
@@ -24,7 +24,7 @@
 (function () {
     "use strict";
 
-    const CURRENT_VERSION = "8.4.7";
+    const CURRENT_VERSION = "8.4.8";
     const INSTANCE_ATTR = "data-steampy-price-compare-active";
     const activeVersion = document.documentElement.getAttribute(INSTANCE_ATTR);
 
@@ -42,7 +42,7 @@
     const STEAMPY_BASE_URL = "https://steampy.com/";
     const STEAM_BASE_URL = "https://store.steampowered.com/";
 
-    const DONE = "data-steampy-v847-done";
+    const DONE = "data-steampy-v848-done";
     const CACHE_PREFIX = "steampy_v82_";
     const CACHE_TIME = 6 * 60 * 60 * 1000;
     const REALTIME_CACHE_TIME = 2 * 60 * 1000;
@@ -55,6 +55,9 @@
     let historyQueueTimer = null;
     let activePackageRequests = 0;
     let wishlistBottomSpaceFrame = null;
+    let wishlistBottomSpaceTimer = null;
+    let wishlistScrollElement = null;
+    let wishlistScrollTimer = null;
 
     function compareVersions(left, right) {
         const a = String(left).split(".").map(Number);
@@ -788,11 +791,14 @@ if (location.href.includes("/wishlist")) {
     }
 
     function scheduleWishlistBottomSpaceUpdate() {
-        if (!location.href.includes("/wishlist") || wishlistBottomSpaceFrame !== null) return;
-        wishlistBottomSpaceFrame = requestAnimationFrame(() => {
-            wishlistBottomSpaceFrame = null;
-            updateWishlistBottomSpace();
-        });
+        clearTimeout(wishlistBottomSpaceTimer);
+        wishlistBottomSpaceTimer = setTimeout(() => {
+            if (wishlistBottomSpaceFrame !== null) cancelAnimationFrame(wishlistBottomSpaceFrame);
+            wishlistBottomSpaceFrame = requestAnimationFrame(() => {
+                wishlistBottomSpaceFrame = null;
+                updateWishlistBottomSpace();
+            });
+        }, 150);
     }
 
     function updateWishlistBottomSpace() {
@@ -804,28 +810,42 @@ if (location.href.includes("/wishlist")) {
             delete footerSpacer.dataset.steampyExtraHeight;
         }
 
-        const root =
-            document.querySelector("#wishlist_ctn") ||
-            document.querySelector("#wishlist_items") ||
-            document.querySelector("[class*='WishlistPage']");
-        if (!root) return;
+        const footer = document.querySelector("#footer") || document.querySelector("footer");
+        if (!footer) return;
 
-        if (!root.dataset.steampyBaseMarginBottom) {
-            root.dataset.steampyBaseMarginBottom = String(parseFloat(getComputedStyle(root).marginBottom) || 0);
+        if (!footer.dataset.steampyBaseMarginTop) {
+            footer.dataset.steampyBaseMarginTop = String(parseFloat(getComputedStyle(footer).marginTop) || 0);
         }
-        const baseMargin = Number(root.dataset.steampyBaseMarginBottom || 0);
+        const baseMargin = Number(footer.dataset.steampyBaseMarginTop || 0);
+
+        if (!location.href.includes("/wishlist")) {
+            footer.style.marginTop = `${baseMargin}px`;
+            delete footer.dataset.steampyExtraMarginTop;
+            return;
+        }
 
         const boxes = [...document.querySelectorAll('.price-box[data-steampy-key^="wishlist:"]')]
             .filter(box => !box.closest("#steampy-wishlist-box-parking") && box.offsetParent !== null);
         if (!boxes.length) {
-            root.style.marginBottom = `${baseMargin}px`;
+            const retained = Number(footer.dataset.steampyExtraMarginTop || 0);
+            footer.style.marginTop = `${baseMargin + retained}px`;
             return;
         }
 
         const lastBox = boxes.reduce((last, box) =>
             box.getBoundingClientRect().bottom > last.getBoundingClientRect().bottom ? box : last
         );
-        root.style.marginBottom = `${baseMargin + Math.ceil(lastBox.getBoundingClientRect().height) + 32}px`;
+        let retained = Number(footer.dataset.steampyExtraMarginTop || 0);
+        footer.style.marginTop = `${baseMargin + retained}px`;
+
+        const missingSpace = Math.ceil(
+            lastBox.getBoundingClientRect().bottom + 32 - footer.getBoundingClientRect().top
+        );
+        if (missingSpace > 0) {
+            retained += missingSpace;
+            footer.dataset.steampyExtraMarginTop = String(retained);
+            footer.style.marginTop = `${baseMargin + retained}px`;
+        }
     }
 
     function removeLegacyPriceBoxes() {
@@ -1554,13 +1574,61 @@ if (location.href.includes("/wishlist")) {
         scheduleWishlistBottomSpaceUpdate();
     }
 
+    function getWishlistScrollElement() {
+        return document.querySelector("#StoreTemplate") || document.scrollingElement;
+    }
+
+    function wishlistCardDistance(card) {
+        const scroller = getWishlistScrollElement();
+        const viewport = scroller?.getBoundingClientRect();
+        const viewportTop = viewport && viewport.height ? viewport.top : 0;
+        const viewportBottom = viewport && viewport.height ? viewport.bottom : window.innerHeight;
+        const viewportCenter = (viewportTop + viewportBottom) / 2;
+        const rect = card.getBoundingClientRect();
+        return Math.abs((rect.top + rect.bottom) / 2 - viewportCenter);
+    }
+
+    function isWishlistCardNearViewport(card) {
+        const scroller = getWishlistScrollElement();
+        const viewport = scroller?.getBoundingClientRect();
+        const viewportTop = viewport && viewport.height ? viewport.top : 0;
+        const viewportBottom = viewport && viewport.height ? viewport.bottom : window.innerHeight;
+        const viewportHeight = Math.max(1, viewportBottom - viewportTop);
+        const overscan = Math.max(300, viewportHeight * 0.4);
+        const rect = card.getBoundingClientRect();
+        return rect.bottom >= viewportTop - overscan && rect.top <= viewportBottom + overscan;
+    }
+
+    function bindWishlistScroll() {
+        if (!location.href.includes("/wishlist")) return;
+        const scroller = getWishlistScrollElement();
+        if (!scroller || scroller === wishlistScrollElement) return;
+
+        wishlistScrollElement?.removeEventListener("scroll", scheduleWishlistViewportScan);
+        wishlistScrollElement = scroller;
+        wishlistScrollElement.addEventListener("scroll", scheduleWishlistViewportScan, { passive: true });
+    }
+
+    function scheduleWishlistViewportScan() {
+        if (!location.href.includes("/wishlist")) return;
+        clearTimeout(wishlistScrollTimer);
+        wishlistScrollTimer = setTimeout(() => {
+            if (!location.href.includes("/wishlist")) return;
+            restoreCachedWishlistBoxesImmediately();
+            scanWishlist();
+        }, 80);
+    }
+
     async function scanWishlist() {
         const cards = getWishlistCards();
         cleanupWishlistPriceBoxes(cards);
+        bindWishlistScroll();
 
-        for (const card of cards) {
-            if (!card || card.hasAttribute(DONE)) continue;
+        const nearbyCards = cards
+            .filter(card => card && !card.hasAttribute(DONE) && isWishlistCardNearViewport(card))
+            .sort((left, right) => wishlistCardDistance(left) - wishlistCardDistance(right));
 
+        for (const card of nearbyCards) {
             const appId = wishlistAppId(card);
             if (!appId) continue;
 
@@ -1599,6 +1667,7 @@ if (location.href.includes("/wishlist")) {
         scanBundlePage();
         scanCartPage();
         scanWishlistAndSearch();
+        scheduleWishlistBottomSpaceUpdate();
     }
 
     function restoreCachedWishlistBoxesImmediately() {
