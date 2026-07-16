@@ -2,7 +2,7 @@
 // @name         SteamPY Price Compare
 // @name:zh-CN   SteamPY 价格对比
 // @namespace    https://github.com/Ceylan233/SteamPY-Price-Compare
-// @version      8.3.8
+// @version      8.4.5
 // @description  Steam 商店/购物车/愿望单/搜索页显示 SteamPY 实时最低挂单、Steam 史低和价格对比。
 // @author       Jiuyue
 // @match        https://store.steampowered.com/*
@@ -24,7 +24,7 @@
 (function () {
     "use strict";
 
-    const CURRENT_VERSION = "8.3.8";
+    const CURRENT_VERSION = "8.4.5";
     const INSTANCE_ATTR = "data-steampy-price-compare-active";
     const activeVersion = document.documentElement.getAttribute(INSTANCE_ATTR);
 
@@ -42,14 +42,19 @@
     const STEAMPY_BASE_URL = "https://steampy.com/";
     const STEAM_BASE_URL = "https://store.steampowered.com/";
 
-    const DONE = "data-steampy-v838-done";
+    const DONE = "data-steampy-v845-done";
     const CACHE_PREFIX = "steampy_v82_";
     const CACHE_TIME = 6 * 60 * 60 * 1000;
     const REALTIME_CACHE_TIME = 2 * 60 * 1000;
     const HISTORY_CACHE_TIME = 24 * 60 * 60 * 1000;
     const DEBUG = false;
     const historyQueue = new Map();
+    const packageLookupQueue = new Map();
+    const packageRequestQueue = [];
+    const renderedPriceCache = new Map();
     let historyQueueTimer = null;
+    let activePackageRequests = 0;
+    let wishlistBottomSpaceFrame = null;
 
     function compareVersions(left, right) {
         const a = String(left).split(".").map(Number);
@@ -98,6 +103,7 @@
     }
 
     addStyle();
+    bindPriceTableToggle();
     ensureTokenHintOnce();
     hookHistory();
     observeDom();
@@ -333,29 +339,66 @@
         }
     }
 
+    function schedulePackageRequest(task) {
+        return new Promise((resolve, reject) => {
+            packageRequestQueue.push({ task, resolve, reject });
+            pumpPackageRequests();
+        });
+    }
+
+    function pumpPackageRequests() {
+        while (activePackageRequests < 4 && packageRequestQueue.length) {
+            const item = packageRequestQueue.shift();
+            activePackageRequests += 1;
+            Promise.resolve()
+                .then(item.task)
+                .then(item.resolve, item.reject)
+                .finally(() => {
+                    activePackageRequests -= 1;
+                    pumpPackageRequests();
+                });
+        }
+    }
+
     async function appToPackage(appId) {
         const key = `pkg_${appId}`;
         const cached = cacheGet(key);
-        if (cached) return cached;
+        if (typeof cached === "string") return cached;
+        if (cached?.missing && Date.now() < Number(cached.retryAfter || 0)) return null;
 
-        try {
-            const json = await requestJSON(API.appDetails(appId));
-            const groups = json?.[appId]?.data?.package_groups || [];
-            let packageId = null;
+        const pending = packageLookupQueue.get(key);
+        if (pending) return pending;
 
-            for (const group of groups) {
-                for (const sub of group.subs || []) {
-                    if (!sub.packageid) continue;
-                    packageId = String(sub.packageid);
-                    if (sub.is_free_license === false) break;
+        const lookup = schedulePackageRequest(async () => {
+            try {
+                const json = await requestJSON(API.appDetails(appId));
+                const groups = json?.[appId]?.data?.package_groups || [];
+                let packageId = null;
+
+                for (const group of groups) {
+                    for (const sub of group.subs || []) {
+                        if (!sub.packageid) continue;
+                        packageId = String(sub.packageid);
+                        if (sub.is_free_license === false) break;
+                    }
+                    if (packageId) break;
                 }
-                if (packageId) break;
-            }
 
-            if (packageId) cacheSet(key, packageId);
-            return packageId;
-        } catch {
+                if (packageId) {
+                    cacheSet(key, packageId);
+                    return packageId;
+                }
+            } catch {}
+
+            cacheSet(key, { missing: true, retryAfter: Date.now() + 5 * 60 * 1000 });
             return null;
+        });
+
+        packageLookupQueue.set(key, lookup);
+        try {
+            return await lookup;
+        } finally {
+            packageLookupQueue.delete(key);
         }
     }
 
@@ -699,6 +742,82 @@ if (location.href.includes("/wishlist")) {
         box.innerHTML = html;
     }
 
+    function cacheRenderedPriceBox(box, complete) {
+        const key = box?.dataset?.steampyKey;
+        if (!key) return;
+        const previous = renderedPriceCache.get(key);
+        renderedPriceCache.set(key, {
+            box,
+            complete: complete ?? previous?.complete ?? true,
+            steamPrice: box.dataset.steamPrice || "",
+            pyPrice: box.dataset.pyPrice || "",
+            priceSource: box.dataset.priceSource || ""
+        });
+    }
+
+    function restoreRenderedPriceBox(box, key) {
+        const cached = renderedPriceCache.get(key);
+        if (!cached?.box) return null;
+
+        const restoredBox = cached.box;
+        if (restoredBox !== box) box.replaceWith(restoredBox);
+        for (const field of ["steamPrice", "pyPrice", "priceSource"]) {
+            if (cached[field]) restoredBox.dataset[field] = cached[field];
+            else delete restoredBox.dataset[field];
+        }
+        updateCartSummary();
+        return { box: restoredBox, complete: cached.complete };
+    }
+
+    function bindPriceTableToggle() {
+        document.addEventListener("click", event => {
+            const button = event.target.closest?.(".price-table-toggle");
+            if (!button) return;
+
+            const box = button.closest(".price-box");
+            const panel = box?.querySelector(".price-table-panel");
+            if (!panel) return;
+
+            const willExpand = panel.hidden;
+            panel.hidden = !willExpand;
+            button.setAttribute("aria-expanded", String(willExpand));
+            button.textContent = willExpand ? "隐藏" : "表格";
+            cacheRenderedPriceBox(box);
+            scheduleWishlistBottomSpaceUpdate();
+        });
+    }
+
+    function scheduleWishlistBottomSpaceUpdate() {
+        if (!location.href.includes("/wishlist") || wishlistBottomSpaceFrame !== null) return;
+        wishlistBottomSpaceFrame = requestAnimationFrame(() => {
+            wishlistBottomSpaceFrame = null;
+            updateWishlistBottomSpace();
+        });
+    }
+
+    function updateWishlistBottomSpace() {
+        const footer = document.querySelector("#footer, .responsive_footer");
+        if (!footer) return;
+
+        let spacer = document.querySelector("#steampy-wishlist-bottom-spacer");
+        if (!spacer) {
+            spacer = document.createElement("div");
+            spacer.id = "steampy-wishlist-bottom-spacer";
+            footer.insertAdjacentElement("beforebegin", spacer);
+        }
+
+        const boxes = [...document.querySelectorAll('.price-box[data-steampy-key^="wishlist:"]')]
+            .filter(box => !box.closest("#steampy-wishlist-box-parking") && box.offsetParent !== null);
+        if (!boxes.length) {
+            spacer.style.height = "0px";
+            return;
+        }
+
+        const lastBottom = Math.max(...boxes.map(box => box.getBoundingClientRect().bottom));
+        const spacerTop = spacer.getBoundingClientRect().top;
+        spacer.style.height = `${Math.max(0, Math.ceil(lastBottom - spacerTop + 24))}px`;
+    }
+
     function removeLegacyPriceBoxes() {
         document.querySelectorAll(".price-box").forEach(box => {
             if (box.dataset.steampyVersion !== CURRENT_VERSION) box.remove();
@@ -716,15 +835,6 @@ if (location.href.includes("/wishlist")) {
 
     function estimatedRangeText(range) {
         return range ? `${money(range.low)} - ${money(range.high)}` : "未知";
-    }
-
-    function buildBalanceEstimateText(steamPrice, historyPrice) {
-        const currentRange = computeEstimatedRange(steamPrice);
-        const historyRange = computeEstimatedRange(historyPrice);
-        return `
-            <span class="price-link warn-text">当前价倒余额预计：${estimatedRangeText(currentRange)}</span>
-            <span class="price-link warn-text">史低价倒余额预计：${estimatedRangeText(historyRange)}</span>
-        `;
     }
 
     function normalizePositivePrice(v) {
@@ -756,132 +866,206 @@ if (location.href.includes("/wishlist")) {
             : "game";
     }
 
-    function buildHistoryText({ purchaseKind, history, fallbackPrice, steamPrice, steamDiscount }) {
-        const historyPrice = normalizePositivePrice(history?.price ?? fallbackPrice);
-        const url = /^https:\/\//.test(history?.url || "") ? history.url : "";
-
-        if (historyPrice) {
-            let compare = "";
-            if (steamPrice) {
-                const historyGap = Number(steamPrice) - historyPrice;
-                if (historyGap <= 0.01) {
-                    compare = ` <span class="good-text">当前已达史低</span>`;
-                }
-            }
-
-            const label = purchaseKind === "bundle"
-                ? "组合包史低"
-                : purchaseKind === "package"
-                    ? "套餐史低"
-                    : "Steam史低";
-            const discount = history?.cut
-                ? ` <span class="good-text">-${Math.abs(Number(history.cut))}%</span>`
-                : "";
-            const priceText = `${label}：${money(historyPrice)}${discount}`;
-            const priceElement = url
-                ? `<a href="${url}" target="_blank" class="price-link">${priceText}</a>`
-                : `<span class="price-link">${priceText}</span>`;
-            const sourceText = history?.source === "小黑盒"
-                ? ` <span class="weak-text">来源：小黑盒</span>`
-                : history?.source
-                    ? ` <span class="weak-text">来源：ITAD</span>`
-                    : "";
-            return `${priceElement}${sourceText}${compare}`;
-        }
-
-        if (purchaseKind === "bundle") {
-            const current = steamDiscount ? `，当前 ${steamDiscount}` : "";
-            return `<span class="weak-text">组合包史低：暂未收录${current}</span>`;
-        }
-
-        if (purchaseKind === "package") {
-            return `<span class="weak-text">套餐史低：暂未收录</span>`;
-        }
-
-        return `<span class="weak-text">Steam史低：暂无数据</span>`;
+    function escapeHtml(value) {
+        return String(value ?? "")
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;")
+            .replace(/'/g, "&#39;");
     }
 
-    function displayPrices(pyRes, history, placeholder, id, appId, type, purchaseKind, steamPrice, steamDiscount) {
-        let content = "";
-        const fallbackHistoryText = buildHistoryText({
-            purchaseKind,
-            history,
-            fallbackPrice: null,
-            steamPrice,
-            steamDiscount
-        });
+    function compareWithSteam(steamPrice, candidatePrice) {
+        const steam = normalizePositivePrice(steamPrice);
+        const candidate = normalizePositivePrice(candidatePrice);
+        if (!steam || !candidate) return "-";
 
-        let finalKeyPrice = null;
-        let finalSource = "";
-        let canCount = false;
+        const diff = steam - candidate;
+        if (Math.abs(diff) <= 0.01) return "同价";
+        if (diff < 0) return "-";
+        return `省 ${money(diff)} / ${Math.round(diff / steam * 100)}%`;
+    }
 
-        if (pyRes?.success && pyRes.result) {
-            const r = pyRes.result;
+    function historyLabel(purchaseKind) {
+        if (purchaseKind === "bundle") return "组合包史低";
+        if (purchaseKind === "package") return "套餐史低";
+        return "Steam 史低";
+    }
 
-            const gameId = r.id;
-            const realtimePrice = normalizePositivePrice(r.realKeyPrice);
-            const estimatedRange = computeEstimatedRange(steamPrice);
-            const steamHistoryPrice = normalizePositivePrice(history?.price ?? r.fixedHisPrice);
-            const balanceEstimateText = buildBalanceEstimateText(steamPrice, steamHistoryPrice);
+    function comparisonRow({ label, value, compare = "-", note = "", href = "", className = "" }) {
+        const safeValue = escapeHtml(value || "未知");
+        const valueHtml = /^https:\/\//.test(href)
+            ? `<a class="price-table-link" href="${escapeHtml(href)}" target="_blank">${safeValue}</a>`
+            : safeValue;
+        const noteHtml = note
+            ? `<span class="price-table-status">${escapeHtml(note)}</span>`
+            : `<span class="price-table-muted">-</span>`;
 
-            if (realtimePrice) {
-                finalKeyPrice = realtimePrice;
-                finalSource = "实时挂单";
-            } else if (estimatedRange) {
-                finalKeyPrice = estimatedRange.high;
-                finalSource = "7.5-8.5折估算";
-            }
+        return `
+            <tr class="${escapeHtml(className)}">
+                <td><span class="price-table-label"><span class="price-table-dot"></span>${escapeHtml(label)}</span></td>
+                <td class="price-table-value">${valueHtml}</td>
+                <td class="price-table-compare">${escapeHtml(compare)}</td>
+                <td>${noteHtml}</td>
+            </tr>
+        `;
+    }
 
-            canCount = !!(steamPrice && finalKeyPrice);
+    function inlineSummaryItem({ label = "", value, accentNote = "", note = "", href = "", className = "" }) {
+        const safeValue = escapeHtml(value || "未知");
+        const valueHtml = /^https:\/\//.test(href)
+            ? `<a class="price-inline-link" href="${escapeHtml(href)}" target="_blank">${safeValue}</a>`
+            : safeValue;
+        return `
+            <span class="price-inline-item ${escapeHtml(className)}">
+                ${label ? `<span class="price-inline-label">${escapeHtml(label)}：</span>` : ""}
+                <span class="price-inline-value">${valueHtml}</span>
+                ${accentNote ? `<span class="price-inline-accent">${escapeHtml(accentNote)}</span>` : ""}
+                ${note ? `<span class="price-inline-note">${escapeHtml(note)}</span>` : ""}
+            </span>
+        `;
+    }
 
-            const marketPrice = r.marketPrice ?? null;
-            const daiPrice = r.daiPrice ?? null;
+    function displayPrices(pyRes, history, placeholder, id, appId, type, purchaseKind, steamPrice, steamDiscount, cacheResult = true) {
+        const tableWasExpanded = placeholder.querySelector(".price-table-panel")?.hidden === false;
+        const r = pyRes?.success && pyRes.result ? pyRes.result : null;
+        const gameId = r?.id || null;
+        const realtimePrice = normalizePositivePrice(r?.realKeyPrice);
+        const marketPrice = normalizePositivePrice(r?.marketPrice);
+        const daiPrice = normalizePositivePrice(r?.daiPrice);
+        const steamHistoryPrice = normalizePositivePrice(history?.price ?? r?.fixedHisPrice);
+        const currentBalanceRange = computeEstimatedRange(steamPrice);
+        const historyBalanceRange = computeEstimatedRange(steamHistoryPrice);
 
-            let saveText = "";
-            if (steamPrice && finalKeyPrice) {
-                const diff = Number(steamPrice) - Number(finalKeyPrice);
-                saveText = diff > 0
-                    ? `<span class="good-text">省 ${money(diff)} / ${Math.round(diff / Number(steamPrice) * 100)}%</span>`
-                    : `<span class="warn-text">CDK暂不划算</span>`;
-            }
+        let finalKeyPrice = realtimePrice || currentBalanceRange?.high || null;
+        const finalSource = realtimePrice ? "实时挂单" : "7.5-8.5折估算";
+        const canCount = !!(steamPrice && finalKeyPrice);
 
-            const realtimeText = realtimePrice
-                ? `<a href="${API.cdkDetail(gameId)}" target="_blank" class="price-link">PY实时最低：${money(realtimePrice)}</a> <span class="good-text">实时</span>`
-                : `<a href="${API.cdkDetail(gameId)}" target="_blank" class="price-link warn-text">PY实时最低：${r.saleMessage || "暂不可用"}</a>`;
+        const historyUrl = /^https:\/\//.test(history?.url || "") ? history.url : "";
+        const historySource = history?.source === "小黑盒"
+            ? "小黑盒"
+            : history?.source
+                ? "ITAD"
+                : "暂无数据";
+        const historyCut = history?.cut ? ` · -${Math.abs(Number(history.cut))}%` : "";
+        const historyNote = steamHistoryPrice ? `${historySource}${historyCut}` : historySource;
+        const realtimeMessage = r?.saleMessage || pyRes?.message || "SteamPY未收录";
+        const realtimeSaving = compareWithSteam(steamPrice, realtimePrice);
+        const inlineSummary = [
+            inlineSummaryItem({
+                label: "PY实时最低",
+                value: realtimePrice ? money(realtimePrice) : realtimeMessage,
+                accentNote: realtimePrice ? "实时" : "",
+                href: gameId ? API.cdkDetail(gameId) : "",
+                className: realtimePrice ? "price-inline-realtime" : "price-inline-warning"
+            }),
+            inlineSummaryItem({
+                label: historyLabel(purchaseKind),
+                value: money(steamHistoryPrice),
+                accentNote: steamHistoryPrice && history?.cut ? `-${Math.abs(Number(history.cut))}%` : "",
+                note: steamHistoryPrice ? `来源：${historySource}` : "暂无数据",
+                href: historyUrl,
+                className: "price-inline-history"
+            }),
+            inlineSummaryItem({
+                label: "PY余额购",
+                value: money(marketPrice),
+                href: gameId ? API.balanceBuyDetail(gameId) : ""
+            }),
+            inlineSummaryItem({
+                label: "PY代购",
+                value: money(daiPrice),
+                href: gameId ? API.hotGameDetail(gameId) : ""
+            }),
+            inlineSummaryItem({
+                label: "当前价倒余额",
+                value: estimatedRangeText(currentBalanceRange),
+                note: "7.5折-8.5折",
+                className: "price-inline-warning"
+            }),
+            inlineSummaryItem({
+                label: "史低价倒余额",
+                value: estimatedRangeText(historyBalanceRange),
+                note: "7.5折-8.5折",
+                className: "price-inline-warning"
+            }),
+            realtimeSaving.startsWith("省")
+                ? inlineSummaryItem({ value: realtimeSaving, className: "price-inline-saving" })
+                : ""
+        ].join("");
 
-            const historyText = steamHistoryPrice
-                ? buildHistoryText({
-                    purchaseKind,
-                    history,
-                    fallbackPrice: steamHistoryPrice,
-                    steamPrice,
-                    steamDiscount
-                })
-                : fallbackHistoryText;
+        const rows = [
+            comparisonRow({
+                label: "Steam 当前价",
+                value: money(steamPrice),
+                compare: "基准",
+                note: steamDiscount || "当前"
+            }),
+            comparisonRow({
+                label: historyLabel(purchaseKind),
+                value: money(steamHistoryPrice),
+                compare: compareWithSteam(steamPrice, steamHistoryPrice),
+                note: historyNote,
+                href: historyUrl,
+                className: "price-table-history"
+            }),
+            comparisonRow({
+                label: "PY 实时最低",
+                value: realtimePrice ? money(realtimePrice) : realtimeMessage,
+                compare: compareWithSteam(steamPrice, realtimePrice),
+                note: realtimePrice ? "实时" : "暂无挂单",
+                href: gameId ? API.cdkDetail(gameId) : "",
+                className: realtimePrice ? "price-table-best" : ""
+            }),
+            comparisonRow({
+                label: "PY 余额购",
+                value: money(marketPrice),
+                compare: compareWithSteam(steamPrice, marketPrice),
+                note: r ? "SteamPY" : "未收录",
+                href: gameId ? API.balanceBuyDetail(gameId) : ""
+            }),
+            comparisonRow({
+                label: "PY 代购",
+                value: money(daiPrice),
+                compare: compareWithSteam(steamPrice, daiPrice),
+                note: r ? "SteamPY" : "未收录",
+                href: gameId ? API.hotGameDetail(gameId) : ""
+            }),
+            comparisonRow({
+                label: "当前价倒余额",
+                value: estimatedRangeText(currentBalanceRange),
+                compare: "7.5折 - 8.5折",
+                note: "预计区间"
+            }),
+            comparisonRow({
+                label: "史低价倒余额",
+                value: estimatedRangeText(historyBalanceRange),
+                compare: "7.5折 - 8.5折",
+                note: "预计区间"
+            })
+        ];
 
-            content += `
-                ${realtimeText}
-                ${historyText}
-                <a href="${API.balanceBuyDetail(gameId)}" target="_blank" class="price-link">PY余额购：${money(marketPrice)}</a>
-                <a href="${API.hotGameDetail(gameId)}" target="_blank" class="price-link">PY代购：${money(daiPrice)}</a>
-                ${balanceEstimateText}
-                <span class="price-link">${saveText}</span>
-            `;
-
-        } else {
-            const estimatedRange = computeEstimatedRange(steamPrice);
-            const steamHistoryPrice = normalizePositivePrice(history?.price);
-            finalKeyPrice = estimatedRange?.high ?? null;
-            finalSource = "7.5-8.5折估算";
-            canCount = !!(steamPrice && finalKeyPrice);
-
-            const msg = pyRes?.message || "SteamPY未收录";
-            content += `
-                <span class="price-link warn-text">PY实时最低：${msg}</span>
-                ${fallbackHistoryText}
-                ${buildBalanceEstimateText(steamPrice, steamHistoryPrice)}
-            `;
-        }
+        const content = `
+            <div class="price-table-toolbar">
+                <span class="price-table-summary">${inlineSummary}</span>
+                <button type="button" class="price-table-toggle" aria-expanded="${tableWasExpanded}">${tableWasExpanded ? "隐藏" : "表格"}</button>
+            </div>
+            <div class="price-table-panel"${tableWasExpanded ? "" : " hidden"}>
+                <div class="price-table-wrap">
+                    <table class="price-comparison-table">
+                        <thead>
+                            <tr>
+                                <th>渠道</th>
+                                <th>价格</th>
+                                <th>对比 Steam</th>
+                                <th>说明</th>
+                            </tr>
+                        </thead>
+                        <tbody>${rows.join("")}</tbody>
+                    </table>
+                </div>
+            </div>
+        `;
 
         if (canCount) {
             placeholder.dataset.steamPrice = String(Number(steamPrice));
@@ -894,7 +1078,9 @@ if (location.href.includes("/wishlist")) {
         }
 
         updatePlaceholder(placeholder, content);
+        if (cacheResult) cacheRenderedPriceBox(placeholder, true);
         updateCartSummary();
+        scheduleWishlistBottomSpaceUpdate();
     }
 
     function updateCartSummary() {
@@ -978,8 +1164,12 @@ if (location.href.includes("/wishlist")) {
     }
 
     async function loadPriceIntoTarget(card, target, id, appId, type, key) {
-        const placeholder = createPlaceholder(target);
+        let placeholder = createPlaceholder(target);
         placeholder.dataset.steampyKey = key;
+        const restored = restoreRenderedPriceBox(placeholder, key);
+        if (restored?.complete) return;
+        if (restored?.box) placeholder = restored.box;
+
         const steamPrice = parseSteamPrice(card);
         const steamDiscount = parseSteamDiscount(card);
         const purchaseKind = getPurchaseKind(card, type);
@@ -1261,8 +1451,11 @@ if (location.href.includes("/wishlist")) {
 
         // 先显示结果区。Steam 的 appdetails 可能限流，不能让套餐映射阻塞史低显示。
         card.setAttribute(DONE, "1");
-        const placeholder = createPlaceholder(card);
+        let placeholder = createPlaceholder(card);
         placeholder.dataset.steampyKey = key;
+        const restored = restoreRenderedPriceBox(placeholder, key);
+        if (restored?.complete) return;
+        if (restored?.box) placeholder = restored.box;
 
         const steamPrice = parseSteamPrice(card);
         const steamDiscount = parseSteamDiscount(card);
@@ -1280,7 +1473,8 @@ if (location.href.includes("/wishlist")) {
             "appid",
             "game",
             steamPrice,
-            steamDiscount
+            steamDiscount,
+            false
         );
 
         const subId = await packagePromise;
@@ -1304,35 +1498,45 @@ if (location.href.includes("/wishlist")) {
         );
     }
 
+    function getWishlistBoxParking() {
+        let parking = document.querySelector("#steampy-wishlist-box-parking");
+        if (parking) return parking;
+
+        parking = document.createElement("div");
+        parking.id = "steampy-wishlist-box-parking";
+        parking.hidden = true;
+        document.body.appendChild(parking);
+        return parking;
+    }
+
     function cleanupWishlistPriceBoxes(cards) {
-        const validCards = new Set(cards);
-        const usedCards = new Set();
-        const usedKeys = new Set();
+        const claimedBoxes = new Set();
 
-        document.querySelectorAll(".price-box").forEach(box => {
-            const card = box.previousElementSibling;
-            const key = box.dataset.steampyKey;
-            const valid =
-                key &&
-                validCards.has(card) &&
-                !usedCards.has(card) &&
-                !usedKeys.has(key);
+        cards.forEach(card => {
+            const appId = wishlistAppId(card);
+            if (!appId) return;
 
-            if (!valid) {
-                box.remove();
+            const key = `wishlist:${appId}`;
+            const cachedBox = renderedPriceCache.get(key)?.box;
+            const currentBox = card.nextElementSibling;
+            const box = currentBox?.dataset?.steampyKey === key ? currentBox : cachedBox;
+
+            if (!box) {
+                card.removeAttribute(DONE);
                 return;
             }
 
-            usedCards.add(card);
-            usedKeys.add(key);
+            if (box.previousElementSibling !== card) card.insertAdjacentElement("afterend", box);
+            card.setAttribute(DONE, "1");
+            claimedBoxes.add(box);
         });
 
-        cards.forEach(card => {
-            const box = card.nextElementSibling;
-            if (!box?.classList.contains("price-box") || !box.dataset.steampyKey) {
-                card.removeAttribute(DONE);
-            }
+        const parking = getWishlistBoxParking();
+        renderedPriceCache.forEach((cached, key) => {
+            if (!key.startsWith("wishlist:") || !cached?.box || claimedBoxes.has(cached.box)) return;
+            if (!cached.box.isConnected) parking.appendChild(cached.box);
         });
+        scheduleWishlistBottomSpaceUpdate();
     }
 
     async function scanWishlist() {
@@ -1382,6 +1586,31 @@ if (location.href.includes("/wishlist")) {
         scanWishlistAndSearch();
     }
 
+    function restoreCachedWishlistBoxesImmediately() {
+        if (!location.href.includes("/wishlist")) return;
+
+        for (const card of getWishlistCards()) {
+            const appId = wishlistAppId(card);
+            if (!appId) continue;
+
+            const key = `wishlist:${appId}`;
+            const currentBox = card.nextElementSibling;
+            if (currentBox?.classList.contains("price-box") && currentBox.dataset.steampyKey === key) {
+                card.setAttribute(DONE, "1");
+                continue;
+            }
+            if (currentBox?.classList.contains("price-box")) {
+                getWishlistBoxParking().appendChild(currentBox);
+            }
+
+            const cachedBox = renderedPriceCache.get(key)?.box;
+            if (!cachedBox) continue;
+            card.insertAdjacentElement("afterend", cachedBox);
+            card.setAttribute(DONE, "1");
+        }
+        scheduleWishlistBottomSpaceUpdate();
+    }
+
     function runScans() {
         setTimeout(scan, 500);
         setTimeout(scan, 1500);
@@ -1411,6 +1640,7 @@ if (location.href.includes("/wishlist")) {
     function observeDom() {
         let timer = null;
         const observer = new MutationObserver(() => {
+            restoreCachedWishlistBoxesImmediately();
             clearTimeout(timer);
             timer = setTimeout(() => {
                 removeLegacyPriceBoxes();
@@ -1435,10 +1665,7 @@ if (location.href.includes("/wishlist")) {
                 overflow:hidden;
                 white-space:normal;
                 line-height:1.65;
-                display:flex;
-                flex-wrap:wrap;
-                align-items:center;
-                gap:3px 8px;
+                display:block;
             }
             .steampy-app-box {
                 margin:8px 0 10px 0;
@@ -1462,6 +1689,128 @@ if (location.href.includes("/wishlist")) {
             .good-text { color: #a4d007; font-weight: bold; }
             .warn-text { color: #ffb000; font-weight: bold; }
             .weak-text { color: #8f98a0; font-size: 12px; }
+            .price-table-toolbar {
+                min-height: 24px;
+                display: flex;
+                align-items: flex-start;
+                justify-content: space-between;
+                gap: 8px;
+            }
+            .price-table-summary {
+                min-width: 0;
+                display: flex;
+                flex-wrap: wrap;
+                align-items: center;
+                gap: 3px 8px;
+                color: #c7d5e0;
+                font-size: 13px;
+                line-height: 1.65;
+            }
+            .price-inline-item {
+                display: inline-flex;
+                align-items: baseline;
+                gap: 3px;
+                white-space: nowrap;
+            }
+            .price-inline-label { color: #c7d5e0; }
+            .price-inline-value { color: #ffffff; font-weight: bold; }
+            .price-inline-note { color: #8f98a0; }
+            .price-inline-accent,
+            .price-inline-realtime .price-inline-accent,
+            .price-inline-saving .price-inline-value {
+                color: #a4d007;
+                font-weight: bold;
+            }
+            .price-inline-warning .price-inline-label,
+            .price-inline-warning .price-inline-value {
+                color: #ffb000;
+                font-weight: bold;
+            }
+            .price-inline-warning .price-inline-link { color: #ffb000; }
+            .price-inline-link { color: #ffffff; text-decoration: none; }
+            .price-inline-link:hover { color: #66c0f4; }
+            .price-table-toggle {
+                min-width: 42px;
+                height: 24px;
+                padding: 0 7px;
+                border: 1px solid #3c5870;
+                border-radius: 3px;
+                background: #2a475e;
+                color: #ffffff;
+                font-size: 12px;
+                cursor: pointer;
+                flex: 0 0 auto;
+            }
+            .price-table-toggle:hover { background: #366582; }
+            .price-table-panel { margin-top: 4px; }
+            .price-table-panel[hidden] { display: none; }
+            .price-table-wrap {
+                border: 1px solid #3c5870;
+                border-radius: 3px;
+                overflow: hidden;
+            }
+            .price-comparison-table {
+                width: 100%;
+                border-collapse: collapse;
+                table-layout: fixed;
+                color: #c7d5e0;
+                font-size: 13px;
+            }
+            .price-comparison-table th,
+            .price-comparison-table td {
+                padding: 7px 9px;
+                text-align: left;
+                vertical-align: middle;
+                border-bottom: 1px solid #2b4a63;
+                overflow-wrap: anywhere;
+            }
+            .price-comparison-table th {
+                color: #8f98a0;
+                font-size: 12px;
+                font-weight: normal;
+                background: #16202d;
+            }
+            .price-comparison-table th:nth-child(1) { width: 29%; }
+            .price-comparison-table th:nth-child(2) { width: 25%; }
+            .price-comparison-table th:nth-child(3) { width: 25%; }
+            .price-comparison-table th:nth-child(4) { width: 21%; }
+            .price-comparison-table tbody tr:last-child td { border-bottom: 0; }
+            .price-table-label {
+                display: inline-flex;
+                align-items: center;
+                gap: 7px;
+            }
+            .price-table-dot {
+                width: 7px;
+                height: 7px;
+                border-radius: 50%;
+                background: #8f98a0;
+                flex: 0 0 auto;
+            }
+            .price-table-value {
+                color: #ffffff;
+                font-weight: bold;
+                white-space: nowrap;
+            }
+            .price-table-compare { white-space: nowrap; }
+            .price-table-link {
+                color: #ffffff;
+                text-decoration: none;
+            }
+            .price-table-link:hover { color: #66c0f4; }
+            .price-table-status {
+                display: inline-block;
+                padding: 1px 6px;
+                border-radius: 8px;
+                color: #c7d5e0;
+                background: #34404a;
+                white-space: nowrap;
+            }
+            .price-table-best .price-table-status {
+                color: #ffffff;
+                background: #1a6d96;
+            }
+            .price-table-muted { color: #8f98a0; }
             #steampy-cart-summary {
                 margin-top: 12px;
                 padding: 12px;
@@ -1488,7 +1837,53 @@ if (location.href.includes("/wishlist")) {
                 color: #8f98a0;
             }
             @media screen and (max-width: 767px) {
-                .price-box { flex-direction: column; gap: 4px; }
+                .price-comparison-table thead {
+                    position: absolute;
+                    width: 1px;
+                    height: 1px;
+                    padding: 0;
+                    margin: -1px;
+                    overflow: hidden;
+                    clip: rect(0, 0, 0, 0);
+                    white-space: nowrap;
+                    border: 0;
+                }
+                .price-comparison-table,
+                .price-comparison-table tbody,
+                .price-comparison-table tr,
+                .price-comparison-table td {
+                    display: block;
+                    width: 100%;
+                }
+                .price-comparison-table tr {
+                    display: grid;
+                    grid-template-columns: minmax(0, 1fr) minmax(120px, auto);
+                    gap: 5px 10px;
+                    padding: 8px 9px;
+                    border-bottom: 1px solid #2b4a63;
+                    box-sizing: border-box;
+                }
+                .price-comparison-table tbody tr:last-child { border-bottom: 0; }
+                .price-comparison-table td {
+                    width: auto;
+                    padding: 0;
+                    border: 0;
+                }
+                .price-comparison-table td:nth-child(1) { grid-column: 1; }
+                .price-comparison-table td:nth-child(2) {
+                    grid-column: 2;
+                    grid-row: 1;
+                    text-align: right;
+                }
+                .price-comparison-table td:nth-child(3) {
+                    grid-column: 1;
+                    color: #8f98a0;
+                }
+                .price-comparison-table td:nth-child(4) {
+                    grid-column: 2;
+                    grid-row: 2;
+                    text-align: right;
+                }
             }
         `;
         document.head.appendChild(style);
