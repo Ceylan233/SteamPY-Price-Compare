@@ -2,6 +2,8 @@
 
 Steam 商店价格增强脚本。
 
+![Steam 愿望单价格对比预览](docs/wishlist-v1.2.png)
+
 ## 功能
 
 - ✅ SteamPY 实时最低挂单价格（来自在售卖家列表）
