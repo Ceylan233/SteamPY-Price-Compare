@@ -2,7 +2,7 @@
 // @name         SteamPY Price Compare
 // @name:zh-CN   SteamPY 价格对比
 // @namespace    https://github.com/Ceylan233/SteamPY-Price-Compare
-// @version      8.3.7
+// @version      8.3.8
 // @description  Steam 商店/购物车/愿望单/搜索页显示 SteamPY 实时最低挂单、Steam 史低和价格对比。
 // @author       Jiuyue
 // @match        https://store.steampowered.com/*
@@ -24,7 +24,7 @@
 (function () {
     "use strict";
 
-    const CURRENT_VERSION = "8.3.7";
+    const CURRENT_VERSION = "8.3.8";
     const INSTANCE_ATTR = "data-steampy-price-compare-active";
     const activeVersion = document.documentElement.getAttribute(INSTANCE_ATTR);
 
@@ -42,7 +42,7 @@
     const STEAMPY_BASE_URL = "https://steampy.com/";
     const STEAM_BASE_URL = "https://store.steampowered.com/";
 
-    const DONE = "data-steampy-v837-done";
+    const DONE = "data-steampy-v838-done";
     const CACHE_PREFIX = "steampy_v82_";
     const CACHE_TIME = 6 * 60 * 60 * 1000;
     const REALTIME_CACHE_TIME = 2 * 60 * 1000;
@@ -718,6 +718,15 @@ if (location.href.includes("/wishlist")) {
         return range ? `${money(range.low)} - ${money(range.high)}` : "未知";
     }
 
+    function buildBalanceEstimateText(steamPrice, historyPrice) {
+        const currentRange = computeEstimatedRange(steamPrice);
+        const historyRange = computeEstimatedRange(historyPrice);
+        return `
+            <span class="price-link warn-text">当前价倒余额预计：${estimatedRangeText(currentRange)}</span>
+            <span class="price-link warn-text">史低价倒余额预计：${estimatedRangeText(historyRange)}</span>
+        `;
+    }
+
     function normalizePositivePrice(v) {
         const raw = typeof v === "string"
             ? v.replace(/,/g, "").match(/[0-9]+(?:\.[0-9]+)?/)?.[0]
@@ -727,7 +736,7 @@ if (location.href.includes("/wishlist")) {
     }
 
     function parseSteamDiscount(card) {
-        const text = card?.querySelector(".discount_pct, .bundle_discount")?.textContent || "";
+        const text = card?.querySelector(".discount_pct, .bundle_discount, .bundle_base_discount")?.textContent || "";
         const value = text.match(/\d+(?:\.\d+)?/)?.[0];
         return value ? `-${value}%` : "";
     }
@@ -813,6 +822,7 @@ if (location.href.includes("/wishlist")) {
             const realtimePrice = normalizePositivePrice(r.realKeyPrice);
             const estimatedRange = computeEstimatedRange(steamPrice);
             const steamHistoryPrice = normalizePositivePrice(history?.price ?? r.fixedHisPrice);
+            const balanceEstimateText = buildBalanceEstimateText(steamPrice, steamHistoryPrice);
 
             if (realtimePrice) {
                 finalKeyPrice = realtimePrice;
@@ -854,12 +864,13 @@ if (location.href.includes("/wishlist")) {
                 ${historyText}
                 <a href="${API.balanceBuyDetail(gameId)}" target="_blank" class="price-link">PY余额购：${money(marketPrice)}</a>
                 <a href="${API.hotGameDetail(gameId)}" target="_blank" class="price-link">PY代购：${money(daiPrice)}</a>
-                ${!realtimePrice && estimatedRange ? `<span class="price-link warn-text">倒余额预计：${estimatedRangeText(estimatedRange)}</span>` : ""}
+                ${balanceEstimateText}
                 <span class="price-link">${saveText}</span>
             `;
 
         } else {
             const estimatedRange = computeEstimatedRange(steamPrice);
+            const steamHistoryPrice = normalizePositivePrice(history?.price);
             finalKeyPrice = estimatedRange?.high ?? null;
             finalSource = "7.5-8.5折估算";
             canCount = !!(steamPrice && finalKeyPrice);
@@ -868,7 +879,7 @@ if (location.href.includes("/wishlist")) {
             content += `
                 <span class="price-link warn-text">PY实时最低：${msg}</span>
                 ${fallbackHistoryText}
-                <span class="price-link warn-text">倒余额预计价格：${estimatedRangeText(estimatedRange)}</span>
+                ${buildBalanceEstimateText(steamPrice, steamHistoryPrice)}
             `;
         }
 
@@ -966,41 +977,7 @@ if (location.href.includes("/wishlist")) {
             .filter(box => box.dataset.steampyKey === key);
     }
 
-    async function attachPrice(card, id, appId, type) {
-        if (!card || !id || !appId || !type) return;
-
-        const key = priceBoxKey(id, appId, type);
-        const existingBoxes = findPriceBoxes(key);
-        const existingBox = existingBoxes[0];
-
-        if (existingBox) {
-            existingBoxes.slice(1).forEach(box => box.remove());
-            card.setAttribute(DONE, "1");
-
-            if (location.href.includes("/wishlist") && existingBox.previousElementSibling !== card) {
-                card.insertAdjacentElement("afterend", existingBox);
-            }
-            return;
-        }
-
-        card.setAttribute(DONE, "1");
-
-        let target;
-
-        if (/\/app\/\d+/.test(location.pathname)) {
-            // 详情页 / DLC 独立页：整块购买区域作为定位基准。
-            target = card;
-        } else if (location.href.includes("/wishlist")) {
-            // 愿望单价格框固定跟在整张卡片后面。
-            target = card;
-        } else {
-            target =
-                card.querySelector(".ysGS-IPPWEkwN-O5rr-0V") ||
-                card.querySelector("[class*='price']") ||
-                card.querySelector("[class*='Price']") ||
-                card;
-        }
-
+    async function loadPriceIntoTarget(card, target, id, appId, type, key) {
         const placeholder = createPlaceholder(target);
         placeholder.dataset.steampyKey = key;
         const steamPrice = parseSteamPrice(card);
@@ -1024,6 +1001,49 @@ if (location.href.includes("/wishlist")) {
         );
     }
 
+    async function attachPrice(card, id, appId, type) {
+        if (!card || !id || !appId || !type) return;
+
+        const key = priceBoxKey(id, appId, type);
+        const existingBoxes = findPriceBoxes(key);
+        const existingBox = existingBoxes[0];
+
+        if (existingBox) {
+            existingBoxes.slice(1).forEach(box => box.remove());
+            card.setAttribute(DONE, "1");
+
+            if (location.href.includes("/wishlist") && existingBox.previousElementSibling !== card) {
+                card.insertAdjacentElement("afterend", existingBox);
+            }
+            return;
+        }
+
+        card.setAttribute(DONE, "1");
+
+        if (type === "bundleid" && bundleIdFromUrl(location.href)) {
+            await loadPriceIntoTarget(card, card, id, appId, type, key);
+            return;
+        }
+
+        let target;
+
+        if (/\/app\/\d+/.test(location.pathname)) {
+            // 详情页 / DLC 独立页：整块购买区域作为定位基准。
+            target = card;
+        } else if (location.href.includes("/wishlist")) {
+            // 愿望单价格框固定跟在整张卡片后面。
+            target = card;
+        } else {
+            target =
+                card.querySelector(".ysGS-IPPWEkwN-O5rr-0V") ||
+                card.querySelector("[class*='price']") ||
+                card.querySelector("[class*='Price']") ||
+                card;
+        }
+
+        await loadPriceIntoTarget(card, target, id, appId, type, key);
+    }
+
     function getStoreAppId() {
         const el = document.querySelector(".game_page_background.game[data-miniprofile-appid]");
         return el?.getAttribute("data-miniprofile-appid") || appIdFromUrl(location.href);
@@ -1042,6 +1062,39 @@ if (location.href.includes("/wishlist")) {
             if (!input) return;
             attachPrice(wrapper, input.value, appId, input.name);
         });
+    }
+
+    function firstAppIdFromBundleData(card) {
+        const dataCard = card?.hasAttribute("data-ds-bundle-data")
+            ? card
+            : document.querySelector("[data-ds-bundle-data]");
+        const raw = dataCard?.getAttribute("data-ds-bundle-data");
+        if (!raw) return null;
+
+        try {
+            const data = JSON.parse(raw);
+            const appId = data?.m_rgItems?.[0]?.m_rgIncludedAppIDs?.[0];
+            return appId ? String(appId) : null;
+        } catch {
+            return null;
+        }
+    }
+
+    async function scanBundlePage() {
+        const bundleId = bundleIdFromUrl(location.href);
+        if (!bundleId) return;
+
+        const cards = [...document.querySelectorAll(
+            `.game_area_purchase_game[data-ds-bundleid="${bundleId}"]`
+        )];
+        if (!cards.length) return;
+
+        const card = cards.find(item => item.offsetParent !== null) || cards[0];
+        if (card.hasAttribute(DONE)) return;
+
+        const appId = firstAppIdFromBundleData(card) || await bundleToFirstApp(bundleId);
+        if (!appId) return;
+        attachPrice(card, bundleId, appId, "bundleid");
     }
 
     function getCartCards() {
@@ -1324,6 +1377,7 @@ if (location.href.includes("/wishlist")) {
 
     function scan() {
         scanStorePage();
+        scanBundlePage();
         scanCartPage();
         scanWishlistAndSearch();
     }
